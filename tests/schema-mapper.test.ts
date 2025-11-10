@@ -74,6 +74,18 @@ test("OpenAI pass-through picks max_tokens over max_completion_tokens and forwar
 	expect.toBe(mapped.stream, false);
 });
 
+test("OpenAI maps max_completion_tokens for gpt-5", () => {
+	const body: ChatCompletionRequest = {
+		model: "gpt-5",
+		messages: [{ role: "user", content: "Go" }],
+		max_tokens: 42, // user input still honored, but mapped by field name
+		stream: false,
+	};
+	const mapped = mapOAItoOpenAI(body) as any;
+	expect.toBe(mapped.max_completion_tokens, 42);
+	expect.toBe(mapped.max_tokens, undefined);
+});
+
 function sseFromString(str: string): ReadableStream<Uint8Array> {
 	return new ReadableStream<Uint8Array>({
 		start(controller) {

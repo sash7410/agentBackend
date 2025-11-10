@@ -66,4 +66,15 @@ curl -sS -i "$URL" \
   }'
 echo -e "\n"
 
+echo "== OpenAI gpt-5 uses max_completion_tokens (streaming) =="
+curl -sS -N -i "$URL" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5",
+    "messages": [{ "role": "user", "content": "Stream using gpt-5" }],
+    "max_tokens": 32,
+    "stream": true
+  }'
+echo -e "\n"
+
 

@@ -179,7 +179,7 @@ export default {
 			return oaiErrorEnvelope(err?.message ?? "Invalid request", null, 400);
 		}
 		console.log(
-			`[${requestId}] mapped->openai msgs=${openaiReq.messages.length} max_tokens=${openaiReq.max_tokens ?? "n/a"} stop=${openaiReq.stop?.length ?? 0} tools=${openaiReq.tools ? openaiReq.tools.length : 0} stream=${openaiReq.stream}`,
+			`[${requestId}] mapped->openai msgs=${openaiReq.messages.length} max=${openaiReq.max_tokens ?? (openaiReq as any).max_completion_tokens ?? "n/a"} stop=${openaiReq.stop?.length ?? 0} tools=${openaiReq.tools ? openaiReq.tools.length : 0} stream=${openaiReq.stream}`,
 		);
 
 		const oaiHeaders: Record<string, string> = {

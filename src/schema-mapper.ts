@@ -42,6 +42,7 @@ export type OpenAIChatRequest = {
 	messages: { role: "system" | "user" | "assistant" | "tool"; content: string; name?: string }[];
 	temperature?: number;
 	max_tokens?: number;
+	max_completion_tokens?: number;
 	stop?: string[];
 	tools?: any[];
 	stream?: boolean;
@@ -122,6 +123,11 @@ function selectMaxTokens(req: ChatCompletionRequest, provider: "anthropic" | "op
 	return clamp(chosen, 1, MAX_TOKENS_CAP);
 }
 
+function useMaxCompletionTokensField(model: string): boolean {
+	const m = (model || "").toLowerCase();
+	return m.startsWith("gpt-5");
+}
+
 export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: AnthropicRequest; warnIgnoredTools: boolean } {
 	if (!req || typeof req !== "object") {
 		throw new Error("Invalid request body");
@@ -198,7 +204,13 @@ export function mapOAItoOpenAI(req: ChatCompletionRequest): OpenAIChatRequest {
 		stop,
 		stream,
 	};
-	if (maxTokens !== undefined) openaiReq.max_tokens = maxTokens;
+	if (maxTokens !== undefined) {
+		if (useMaxCompletionTokensField(req.model)) {
+			openaiReq.max_completion_tokens = maxTokens;
+		} else {
+			openaiReq.max_tokens = maxTokens;
+		}
+	}
 	if (tools) openaiReq.tools = tools;
 	return openaiReq;
 }
