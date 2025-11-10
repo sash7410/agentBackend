@@ -1,0 +1,17 @@
+{
+  "name": "cf-oai-claude-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Cloudflare Worker that proxies OpenAI chat to Anthropic Claude with streaming",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "echo \"Wrangler will bundle TypeScript for worker; nothing to build.\"",
+    "test": "node -r ts-node/register tests/run-tests.ts"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3",
+    "wrangler": "^4.46.0"
+  }
+}
