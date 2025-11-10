@@ -1,8 +1,12 @@
 import { mapOAItoAnthropic, mapOAItoOpenAI, anthropicSSEtoOAIChunks, ChatCompletionRequest } from "./schema-mapper";
+import { ReasoningService, shouldUseReasoning, EnvLike as ReasoningEnv } from "./reasoning/service";
 
 export interface Env {
 	ANTHROPIC_API_KEY: string;
 	OPENAI_API_KEY: string;
+	// Optional reasoning gateway configuration
+	REASONING_MODELS?: string;
+	ENABLE_REASONING?: string;
 }
 
 type WorkerExecutionContext = {
@@ -117,8 +121,37 @@ export default {
 			return oaiErrorEnvelope("Request must include at least one user message", null, 400);
 		}
 
-		// STEP 4: Decide provider by model prefix
+		// STEP 4: Decide provider/route
+		const useReasoning = shouldUseReasoning(body, env as unknown as ReasoningEnv);
 		const isClaude = model.toLowerCase().startsWith("claude");
+
+		if (useReasoning) {
+			console.log(
+				`[${requestId}] route=reasoning selected model=${model} reason=${
+					typeof body.reasoning_effort === "string" && body.reasoning_effort ? "reasoning_effort" : "model_pattern"
+				}`,
+			);
+			// Responses (Reasoning) route. Supports stream or non-stream; tools allowed (non-stream fully handled).
+			const service = new ReasoningService();
+			if (stream) {
+				const translated = await service.createStream(body, env as unknown as ReasoningEnv);
+				const sseHeaders = new Headers();
+				sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
+				sseHeaders.set("cache-control", "no-cache, no-transform");
+				sseHeaders.set("connection", "keep-alive");
+				console.log(`[${requestId}] streaming start provider=openai.responses model=${model}`);
+				return new Response(translated, { status: 200, headers: sseHeaders });
+			} else {
+				try {
+					const json = await service.create(body, env as unknown as ReasoningEnv);
+					return jsonResponse(json, 200);
+				} catch (e: any) {
+					const msg = e?.message || "Reasoning upstream error";
+					console.log(`[${requestId}] reasoning non-stream error ${msg}`);
+					return oaiErrorEnvelope(msg, 502, 502);
+				}
+			}
+		}
 
 		if (isClaude) {
 			// Anthropic route:

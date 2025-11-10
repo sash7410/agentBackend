@@ -2,6 +2,36 @@
 
 This minimal v1 service runs as a Cloudflare Worker and exposes a single OpenAI-compatible endpoint for Firebender. It routes `claude*` models to Anthropic Messages (with streaming translation) and all other models to OpenAI Chat Completions (pass-through).
 
+### Reasoning Gateway (OpenAI Responses) - optional
+- Disabled by default. Enable with environment variables:
+  - `ENABLE_REASONING=true`
+  - `REASONING_MODELS=o4*,o3*,gpt-4.1*` (comma-separated list; `*` means prefix match)
+- Routing rule: if enabled and either `reasoning_effort` is present on the request OR `model` matches `REASONING_MODELS`, the request is handled by the Reasoning gateway using OpenAI Responses.
+- Input contract: the same Chat Completions JSON you already use (no client change). Extra optional fields honored if present: `max_completion_tokens`, `reasoning_effort`, `system`, `tools`, `tool_choice`, `top_p`.
+- Mapping to Responses:
+  - `messages` → `input[]` with typed parts: user as `{type:"input_text"}`, assistant as `{type:"text"}`.
+  - `system` → `instructions`.
+  - `temperature`, `top_p` → forwarded.
+  - `max_output_tokens` picked from `max_completion_tokens` then `max_tokens`.
+  - `stop` → forwarded.
+  - `tools` and `tool_choice` forwarded using function tool shape and JSON Schema as provided.
+  - `reasoning_effort` → `reasoning.effort`.
+  - `stream` → forwarded.
+- Streaming contract:
+  - Server emits legacy OpenAI chat-completion chunk SSE frames with incremental `choices[0].delta.content`.
+  - Non-text events (e.g., tool calls) are not emitted as text.
+  - Stream ends with a final chunk (with `finish_reason`) followed by `data: [DONE]`.
+  - A trailing `data: {"object":"usage.summary","usage":{...}}` line is sent with usage totals.
+- Non-stream contract:
+  - Returns a single OpenAI-style chat completion JSON with `choices[0].message.content`, `finish_reason`, and `usage`.
+- Tool turns:
+  - Non-stream: executes tools server-side and issues follow-up `responses.create` with `previous_response_id` and a single `function_call_output` item; repeats until the assistant returns final text or a cap on rounds is reached.
+  - Streaming: non-text tool events are ignored by the text translator; tool orchestration occurs server-side (non-text) when applicable.
+- Errors:
+  - 400 invalid request, 401/403 auth, 408 upstream timeout, 429 rate limit, 5xx provider/network. Streaming errors are sent as an SSE `event: error` with JSON message then the stream closes.
+- Observability:
+  - Logs include inbound request id, selected route, upstream response id where available, tool rounds, token usage, latency, and finish reason. Message content is not logged.
+
 ### Features
 - Single endpoint: `/v1/chat/completions` (POST)
 - Accepts Firebender’s OpenAI-shaped request (see Interface below)
