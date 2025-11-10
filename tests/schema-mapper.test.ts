@@ -49,14 +49,15 @@ test("maps stop sequences to stop_sequences (Anthropic)", () => {
 	expect.toEqual(mapped.request.stop_sequences, ["END"]);
 });
 
-test("tools ignored for Anthropic but do not crash; warning flag set", () => {
+test("tools mapped for Anthropic; no warning flag; definitions included", () => {
 	const body: ChatCompletionRequest = {
 		model: "claude",
 		messages: [{ role: "user", content: "Go" }],
 		tools: [{ type: "function", function: { name: "x", parameters: {} } }],
 	};
 	const mapped = mapOAItoAnthropic(body);
-	expect.toBe(mapped.warnIgnoredTools, true);
+	expect.toBe(mapped.warnIgnoredTools, false);
+	expect.toEqual(mapped.request.tools, [{ name: "x", input_schema: {}, description: undefined }]);
 });
 
 test("OpenAI pass-through picks max_tokens over max_completion_tokens and forwards stop", () => {

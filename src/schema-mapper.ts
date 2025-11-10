@@ -33,7 +33,24 @@ export type ChatCompletionRequest = {
 
 export type AnthropicMessage = {
 	role: "user" | "assistant";
-	content: string;
+	content: string | AnthropicContentBlock[];
+};
+
+// Structured content blocks for Anthropic Messages API
+export type AnthropicContentBlock =
+	| { type: "text"; text: string }
+	| { type: "tool_use"; id: string; name: string; input: any }
+	| {
+			type: "tool_result";
+			tool_use_id: string;
+			content?: string | { type: "text"; text: string }[];
+			is_error?: boolean;
+	  };
+
+export type AnthropicToolDef = {
+	name: string;
+	description?: string;
+	input_schema: any;
 };
 
 export type AnthropicRequest = {
@@ -44,6 +61,7 @@ export type AnthropicRequest = {
 	temperature?: number;
 	stop_sequences?: string[];
 	stream: boolean;
+	tools?: AnthropicToolDef[];
 };
 
 export type OpenAIChatRequest = {
@@ -88,6 +106,108 @@ function normalizeContentToText(content: any): { text: string; changed: boolean 
 	}
 	// Fallback stringification
 	return { text: String(content ?? ""), changed: true };
+}
+
+function mapOpenAIToolsToAnthropic(tools: any[] | null | undefined): AnthropicToolDef[] | undefined {
+	if (!Array.isArray(tools) || tools.length === 0) return undefined;
+	const out: AnthropicToolDef[] = [];
+	for (const t of tools) {
+		try {
+			if (t && (t.type === "function" || t.function)) {
+				const fn = t.function ?? {};
+				const name = fn.name ?? t.name;
+				if (typeof name !== "string" || name.length === 0) continue;
+				const description = typeof fn.description === "string" ? fn.description : t.description;
+				const input_schema = fn.parameters ?? { type: "object" };
+				out.push({ name, description, input_schema });
+			}
+		} catch {
+			// ignore malformed tool
+		}
+	}
+	return out.length > 0 ? out : undefined;
+}
+
+function toAnthropicMessagesWithTools(req: ChatCompletionRequest): {
+	system?: string;
+	messages: AnthropicMessage[];
+	hadAnyToolsSignal: boolean;
+	anthropicTools?: AnthropicToolDef[];
+} {
+	let systemText: string | undefined = req.system ?? undefined;
+	const messages: AnthropicMessage[] = [];
+	const anthropicTools = mapOpenAIToolsToAnthropic(req.tools);
+	let hadAnyToolsSignal = Array.isArray(req.tools) && req.tools.length > 0;
+
+	for (const raw of req.messages || []) {
+		const msg: any = raw as any;
+		const role: string = msg.role;
+
+		if (role === "system") {
+			if (!systemText) {
+				const norm = normalizeContentToText(msg.content);
+				systemText = norm.text;
+			}
+			continue;
+		}
+
+		if (role === "assistant") {
+			const toolCalls: any[] | undefined = Array.isArray(msg.tool_calls) ? msg.tool_calls : undefined;
+			if (toolCalls && toolCalls.length > 0) {
+				hadAnyToolsSignal = true;
+				const blocks: AnthropicContentBlock[] = [];
+				const norm = normalizeContentToText(msg.content);
+				if (norm.text && norm.text.trim().length > 0) {
+					blocks.push({ type: "text", text: norm.text });
+				}
+				for (const tc of toolCalls) {
+					const id: string =
+						typeof tc.id === "string" && tc.id.length > 0 ? tc.id : `toolu_${Math.random().toString(36).slice(2, 10)}`;
+					const name: string = tc.function?.name ?? tc.name;
+					let input: any = {};
+					const argStr = tc.function?.arguments ?? tc.arguments;
+					if (typeof argStr === "string") {
+						try {
+							input = JSON.parse(argStr);
+						} catch {
+							input = { __raw: argStr };
+						}
+					} else if (argStr && typeof argStr === "object") {
+						input = argStr;
+					}
+					if (typeof name === "string" && name.length > 0) {
+						blocks.push({ type: "tool_use", id, name, input });
+					}
+				}
+				messages.push({ role: "assistant", content: blocks });
+				continue;
+			}
+			const norm = normalizeContentToText(msg.content);
+			messages.push({ role: "assistant", content: norm.text });
+			continue;
+		}
+
+		if (role === "tool") {
+			hadAnyToolsSignal = true;
+			const toolUseId: string | undefined = msg.tool_call_id || msg.tool_call_id?.toString?.();
+			const norm = normalizeContentToText(msg.content);
+			const block: AnthropicContentBlock = {
+				type: "tool_result",
+				tool_use_id: toolUseId ?? "",
+				content: norm.text ? [{ type: "text", text: norm.text }] : undefined,
+			};
+			messages.push({ role: "user", content: [block] });
+			continue;
+		}
+
+		if (role === "user") {
+			const norm = normalizeContentToText(msg.content);
+			messages.push({ role: "user", content: norm.text });
+			continue;
+		}
+	}
+
+	return { system: systemText, messages, hadAnyToolsSignal, anthropicTools };
 }
 
 function extractSystemAndFilterMessages(req: ChatCompletionRequest): {
@@ -151,8 +271,13 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 		throw new Error("Missing required fields: model, messages");
 	}
 
-	const { system, filtered, hadTools } = extractSystemAndFilterMessages(req);
-	if (!ensureHasUserMessage(filtered)) {
+	const conv = toAnthropicMessagesWithTools(req);
+	if (!ensureHasUserMessage(
+		(conv.messages as any as OAIMessage[]).map((m: any) => {
+			// Treat any user role message as satisfying the requirement
+			return { role: m.role, content: typeof m.content === "string" ? m.content : "" } as OAIMessage;
+		}),
+	)) {
 		throw new Error("At least one user message is required");
 	}
 
@@ -168,7 +293,7 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 	// Debug logs for mapping details (visible in worker logs)
 	try {
 		console.log(
-			`[mapper->anthropic] system_present=${Boolean(system)} msgs_in=${req.messages?.length ?? 0} msgs_out=${filtered.length} had_tools=${hadTools} temp=${temperature ?? "n/a"} max_tokens=${maxTokens} stop_seq=${stop_sequences?.length ?? 0} stream=${stream}`,
+			`[mapper->anthropic] system_present=${Boolean(conv.system)} msgs_in=${req.messages?.length ?? 0} msgs_out=${conv.messages.length} had_tools=${conv.hadAnyToolsSignal} temp=${temperature ?? "n/a"} max_tokens=${maxTokens} stop_seq=${stop_sequences?.length ?? 0} stream=${stream}`,
 		);
 	} catch {
 		// ignore logging errors
@@ -179,14 +304,16 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 	return {
 		request: {
 			model: req.model,
-			system: system,
-			messages: filtered,
+			system: conv.system,
+			messages: conv.messages,
 			max_tokens: maxTokens,
 			temperature,
 			stop_sequences,
 			stream,
+			tools: conv.anthropicTools,
 		},
-		warnIgnoredTools: hadTools, // v1 ignores tools for Anthropic
+		// Tools supported in this mapping
+		warnIgnoredTools: false,
 	};
 }
 
