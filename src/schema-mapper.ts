@@ -5,20 +5,29 @@
 // - anthropicSSEtoOAIChunks: converts Anthropic SSE events into OpenAI-compatible SSE chunks
 
 export type OAIRole = "system" | "user" | "assistant" | "tool";
+// OpenAI Chat message in its simplest form for this proxy
 export type OAIMessage = { role: OAIRole; content: string; name?: string };
 
 export type ChatCompletionRequest = {
+	// Temperature controls randomness: 0 is deterministic, higher is more diverse
 	temperature?: number | null;
 	messages: OAIMessage[];
 	model: string;
+	// If not provided, we default to stream=true (especially for Anthropic)
 	stream?: boolean | null;
+	// Some clients send max_tokens; gpt-5 expects max_completion_tokens instead
 	max_tokens?: number | null;
 	stop?: string[] | null;
 	stream_options?: any | null;
+	// Newer OpenAI models (e.g. gpt-5) prefer this name
 	max_completion_tokens?: number | null;
+	// Placeholder for OpenAI reasoning models; not used by this minimal proxy
 	reasoning_effort?: string | null;
+	// A single "system" string; if present, we ensure one system message is applied
 	system?: string | null;
+	// Tools are ignored for Anthropic in this v1; we forward them to OpenAI as-is
 	tools?: any[] | null;
+	// Arbitrary variables clients can pass; we only log the key count
 	user_variables?: Record<string, any> | null;
 };
 
@@ -64,6 +73,8 @@ function ensureHasUserMessage(messages: OAIMessage[]): boolean {
 }
 
 function normalizeContentToText(content: any): { text: string; changed: boolean } {
+	// We only work with plain-text content in this minimal proxy.
+	// If content is an array, extract only text parts.
 	if (typeof content === "string") return { text: content, changed: false };
 	if (Array.isArray(content)) {
 		// Extract only supported "text" parts; ignore others like "thinking", images, audio, etc.
@@ -84,6 +95,8 @@ function extractSystemAndFilterMessages(req: ChatCompletionRequest): {
 	filtered: AnthropicMessage[];
 	hadTools: boolean;
 } {
+	// Move a single system instruction into Anthropic's "system" field and
+	// filter the messages to only user/assistant (Anthropic does not accept system/tool roles in the array)
 	const providedSystem = req.system ?? undefined;
 	let systemText = providedSystem;
 	const filtered: AnthropicMessage[] = [];
@@ -115,8 +128,10 @@ function selectMaxTokens(req: ChatCompletionRequest, provider: "anthropic" | "op
 	const fromReqMaxCompletion = req.max_completion_tokens ?? undefined;
 	let chosen: number | undefined;
 	if (provider === "openai") {
+		// For OpenAI we prefer max_tokens if given, otherwise fall back to max_completion_tokens
 		chosen = fromReqMax ?? fromReqMaxCompletion;
 	} else {
+		// For Anthropic we choose whichever is given, otherwise default
 		chosen = fromReqMax ?? fromReqMaxCompletion ?? DEFAULT_MAX_TOKENS;
 	}
 	if (chosen === undefined || chosen === null) return provider === "anthropic" ? DEFAULT_MAX_TOKENS : undefined;
@@ -150,6 +165,8 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 			? true
 			: Boolean(req.stream);
 
+	// We return Anthropic's native request shape, but we also return a flag if tools were present
+	// so the caller can attach a warning header for the client.
 	return {
 		request: {
 			model: req.model,
@@ -206,8 +223,10 @@ export function mapOAItoOpenAI(req: ChatCompletionRequest): OpenAIChatRequest {
 	};
 	if (maxTokens !== undefined) {
 		if (useMaxCompletionTokensField(req.model)) {
+			// gpt-5 models require "max_completion_tokens"
 			openaiReq.max_completion_tokens = maxTokens;
 		} else {
+			// older OpenAI chat models accept "max_tokens"
 			openaiReq.max_tokens = maxTokens;
 		}
 	}
@@ -282,6 +301,10 @@ export function anthropicSSEtoOAIChunks(
 	upstream: ReadableStream<Uint8Array>,
 	debugPrefix?: string,
 ): ReadableStream<Uint8Array> {
+	// This function converts Anthropic's streaming events (SSE)
+	// into OpenAI-style "chat.completion.chunk" SSE frames.
+	// It introduces a synthetic "assistant role" chunk first,
+	// then emits text deltas, and finally emits a finish chunk and [DONE].
 	const id = generateOpenAIChunkId();
 	const created = Math.floor(Date.now() / 1000);
 	const encoder = new TextEncoder();

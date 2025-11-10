@@ -32,13 +32,16 @@ function oaiErrorEnvelope(message: string, code: string | number | null = null, 
 
 export default {
 	async fetch(req: Request, env: Env, ctx: WorkerExecutionContext): Promise<Response> {
+		// Assign a short random request id for easy log correlation
 		const url = new URL(req.url);
 		const requestId = Math.random().toString(36).slice(2, 10);
 			const normalizedPath = url.pathname.replace(/\/{2,}/g, "/");
 			const method = req.method.toUpperCase();
 			console.log(`[${requestId}] ingress method=${method} path=${url.pathname} normalized=${normalizedPath}`);
 
-			// Minimal compatibility: accept paths that end with /chat/completions (with or without /v1 prefix)
+			// Route detection:
+			// - We implement only /v1/chat/completions (OpenAI-compatible path)
+			// - We also reply to /v1/models (or /models) with a tiny discovery list
 			const isChatCompletions = normalizedPath.endsWith("/chat/completions");
 			const isModels = normalizedPath.endsWith("/models");
 
@@ -48,25 +51,30 @@ export default {
 					{ id: "claude-3-5-sonnet-20241022", object: "model" },
 					{ id: "gpt-4o-mini", object: "model" },
 				];
+				console.log(`[${requestId}] models discovery returned ${data.length} models`);
 				return jsonResponse({ object: "list", data }, 200);
 			}
 
 			// Contract endpoint
 			if (!(method === "POST" && isChatCompletions)) {
+				console.log(`[${requestId}] 404 not found for method=${method} path=${normalizedPath}`);
 				return new Response("Not found", { status: 404 });
 		}
 
-		// Trivial authorization placeholder (replace later as needed)
+		// Authorization placeholder (not enforced in this minimal proxy)
 		// e.g., check Authorization header exists; do not enforce in v1
 
 
+		// STEP 1: Parse the JSON body once.
 		let body: ChatCompletionRequest;
 		try {
 			body = await req.json();
 		} catch {
+			console.log(`[${requestId}] invalid JSON body`);
 			return oaiErrorEnvelope("Request body must be valid JSON", null, 400);
 		}
 
+		// STEP 2: Basic request introspection for logs
 		const model = body?.model ?? "";
 		const stream = body?.stream === null || body?.stream === undefined ? true : Boolean(body?.stream);
 		const userVars = body?.user_variables ? Object.keys(body.user_variables).length : 0;
@@ -78,24 +86,27 @@ export default {
 			`[${requestId}] incoming model=${model} stream=${stream} roles=${JSON.stringify(roles)} uv_keys=${userVars}`,
 		);
 
+		// STEP 3: Validate core fields
 		if (typeof model !== "string" || model.length === 0) {
 			return oaiErrorEnvelope("Field 'model' is required", null, 400);
 		}
 
-		// Validate messages contain at least one user message
+		// Require at least one user message
 		if (!Array.isArray(body.messages) || !body.messages.some((m) => m.role === "user")) {
 			return oaiErrorEnvelope("Request must include at least one user message", null, 400);
 		}
 
+		// STEP 4: Decide provider by model prefix
 		const isClaude = model.toLowerCase().startsWith("claude");
 
 		if (isClaude) {
-			// Anthropic route
-			// Non-stream mode for Anthropic is not supported in v1 per spec
+			// Anthropic route:
+			// - We only support streaming for Anthropic in this minimal proxy
 			if (!stream) {
 				return oaiErrorEnvelope("Anthropic non-streaming is not supported in v1. Please set stream=true.", null, 400);
 			}
 
+			// STEP A: Map incoming OpenAI-style request to Anthropic Messages API
 			let mapped;
 			try {
 				mapped = mapOAItoAnthropic(body);
@@ -106,6 +117,7 @@ export default {
 				`[${requestId}] mapped->anthropic system=${mapped.request.system ? true : false} msgs=${mapped.request.messages.length} max_tokens=${mapped.request.max_tokens} stop=${mapped.request.stop_sequences?.length ?? 0} temp=${mapped.request.temperature ?? "n/a"} warnTools=${mapped.warnIgnoredTools}`,
 			);
 
+			// STEP B: Call Anthropic with streaming enabled
 			const headers: Record<string, string> = {
 				"content-type": "application/json",
 				"anthropic-version": "2023-06-01",
@@ -126,6 +138,7 @@ export default {
 				return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
 			}
 
+			// STEP C: Handle non-OK upstream response
 			if (!upstream.ok || !upstream.body) {
 				const text = await upstream.text().catch(() => "");
 				console.log(
@@ -138,9 +151,10 @@ export default {
 				);
 			}
 
-			// Translate SSE stream to OpenAI-style chunks
+			// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
 			const translated = anthropicSSEtoOAIChunks(model, upstream.body, `[${requestId}] provider=anthropic model=${model}`);
 
+			// Prepare OpenAI-style SSE response headers
 			const sseHeaders = new Headers();
 			sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
 			sseHeaders.set("cache-control", "no-cache, no-transform");
@@ -158,6 +172,7 @@ export default {
 					`[${requestId}] streaming start provider=anthropic model=${model} hdrs=${JSON.stringify(hdrObj)}`,
 				);
 			}
+			// STEP E: Return the translated stream to the client
 			const response = new Response(translated, {
 				status: 200,
 				headers: sseHeaders,
@@ -171,7 +186,8 @@ export default {
 			return response;
 		}
 
-		// OpenAI pass-through route
+		// OpenAI pass-through route:
+		// - We keep OpenAI schema, only normalizing a few fields (e.g., gpt-5 uses max_completion_tokens)
 		let openaiReq;
 		try {
 			openaiReq = mapOAItoOpenAI(body);
@@ -182,12 +198,14 @@ export default {
 			`[${requestId}] mapped->openai msgs=${openaiReq.messages.length} max=${openaiReq.max_tokens ?? (openaiReq as any).max_completion_tokens ?? "n/a"} stop=${openaiReq.stop?.length ?? 0} tools=${openaiReq.tools ? openaiReq.tools.length : 0} stream=${openaiReq.stream}`,
 		);
 
+		// STEP F: Call OpenAI with either streaming or non-stream JSON
 		const oaiHeaders: Record<string, string> = {
 			"content-type": "application/json",
 			authorization: `Bearer ${env.OPENAI_API_KEY}`,
 		};
 
 		if (openaiReq.stream) {
+			// Streaming passthrough
 			let upstream: Response;
 			try {
 				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=true`);
@@ -250,6 +268,7 @@ export default {
 					502,
 				);
 			}
+			// We return the JSON exactly as received so client sees OpenAI-standard response
 			const json = await upstream.text();
 			console.log(`[${requestId}] upstream<-openai json_len=${json.length}`);
 			return new Response(json, { status: 200, headers: { "content-type": "application/json" } });
