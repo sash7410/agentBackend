@@ -165,6 +165,15 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 			? true
 			: Boolean(req.stream);
 
+	// Debug logs for mapping details (visible in worker logs)
+	try {
+		console.log(
+			`[mapper->anthropic] system_present=${Boolean(system)} msgs_in=${req.messages?.length ?? 0} msgs_out=${filtered.length} had_tools=${hadTools} temp=${temperature ?? "n/a"} max_tokens=${maxTokens} stop_seq=${stop_sequences?.length ?? 0} stream=${stream}`,
+		);
+	} catch {
+		// ignore logging errors
+	}
+
 	// We return Anthropic's native request shape, but we also return a flag if tools were present
 	// so the caller can attach a warning header for the client.
 	return {
@@ -231,6 +240,16 @@ export function mapOAItoOpenAI(req: ChatCompletionRequest): OpenAIChatRequest {
 		}
 	}
 	if (tools) openaiReq.tools = tools;
+
+	// Debug logs for mapping details (visible in worker logs)
+	try {
+		const maxField = (openaiReq as any).max_completion_tokens ?? openaiReq.max_tokens ?? "n/a";
+		console.log(
+			`[mapper->openai] model=${req.model} msgs_in=${req.messages?.length ?? 0} msgs_out=${openaiReq.messages.length} system_included=${Boolean(req.system)} temp=${temperature ?? "n/a"} max=${maxField} stop=${stop?.length ?? 0} tools=${tools?.length ?? 0} stream=${stream}`,
+		);
+	} catch {
+		// ignore logging errors
+	}
 	return openaiReq;
 }
 

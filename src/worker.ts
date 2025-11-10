@@ -33,6 +33,13 @@ function oaiErrorEnvelope(message: string, code: string | number | null = null, 
 export default {
 	async fetch(req: Request, env: Env, ctx: WorkerExecutionContext): Promise<Response> {
 		// Assign a short random request id for easy log correlation
+		function headersToObject(h: Headers): Record<string, string> {
+			const obj: Record<string, string> = {};
+			h.forEach((value, key) => {
+				obj[key] = value;
+			});
+			return obj;
+		}
 		const url = new URL(req.url);
 		const requestId = Math.random().toString(36).slice(2, 10);
 			const normalizedPath = url.pathname.replace(/\/{2,}/g, "/");
@@ -47,12 +54,13 @@ export default {
 
 			// Optional convenience: respond to GET /v1/models or /models for simple discovery
 			if (method === "GET" && isModels) {
-				const data = [
-					{ id: "claude-3-5-sonnet-20241022", object: "model" },
-					{ id: "gpt-4o-mini", object: "model" },
-				];
-				console.log(`[${requestId}] models discovery returned ${data.length} models`);
-				return jsonResponse({ object: "list", data }, 200);
+				// We don't hard-code models; clients should supply the exact model id.
+				// Returning an empty list with a hint avoids misleading the caller.
+				const data: any[] = [];
+				console.log(`[${requestId}] models discovery requested; returning empty list (support is dynamic by model id)`);
+				const resp = jsonResponse({ object: "list", data }, 200);
+				resp.headers.set("x-info", "This proxy supports any OpenAI (e.g., gpt-*) or Anthropic (e.g., claude-*) model id.");
+				return resp;
 			}
 
 			// Contract endpoint
@@ -75,6 +83,19 @@ export default {
 		}
 
 		// STEP 2: Basic request introspection for logs
+		// BEFORE: Log complete incoming request (method, URL, headers, parsed JSON body)
+		try {
+			const beforeLog = {
+				method,
+				url: req.url,
+				path: normalizedPath,
+				headers: headersToObject(req.headers),
+				body,
+			};
+			console.log(`[${requestId}] BEFORE request ${JSON.stringify(beforeLog)}`);
+		} catch (e) {
+			console.log(`[${requestId}] BEFORE request log error`);
+		}
 		const model = body?.model ?? "";
 		const stream = body?.stream === null || body?.stream === undefined ? true : Boolean(body?.stream);
 		const userVars = body?.user_variables ? Object.keys(body.user_variables).length : 0;
@@ -124,9 +145,23 @@ export default {
 				"x-api-key": env.ANTHROPIC_API_KEY,
 				accept: "text/event-stream",
 			};
+			// AFTER: Log full outbound request to Anthropic (method, URL, headers, mapped body)
+			try {
+				const afterAnthropic = {
+					upstream: "anthropic",
+					method: "POST",
+					url: "https://api.anthropic.com/v1/messages",
+					headers,
+					body: mapped.request,
+				};
+				console.log(`[${requestId}] AFTER request ${JSON.stringify(afterAnthropic)}`);
+			} catch (e) {
+				console.log(`[${requestId}] AFTER request log error (anthropic)`);
+			}
 
 			let upstream: Response;
 			try {
+                console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
 				console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
 				upstream = await fetch("https://api.anthropic.com/v1/messages", {
 					method: "POST",
@@ -203,6 +238,19 @@ export default {
 			"content-type": "application/json",
 			authorization: `Bearer ${env.OPENAI_API_KEY}`,
 		};
+		// AFTER: Log full outbound request to OpenAI (method, URL, headers, mapped body)
+		try {
+			const afterOpenAI = {
+				upstream: "openai",
+				method: "POST",
+				url: "https://api.openai.com/v1/chat/completions",
+				headers: oaiHeaders,
+				body: openaiReq,
+			};
+			console.log(`[${requestId}] AFTER request ${JSON.stringify(afterOpenAI)}`);
+		} catch (e) {
+			console.log(`[${requestId}] AFTER request log error (openai)`);
+		}
 
 		if (openaiReq.stream) {
 			// Streaming passthrough
@@ -248,6 +296,7 @@ export default {
 			let upstream: Response;
 			try {
 				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=false`);
+				console.log(`[${requestId}] openaiReq=${JSON.stringify(openaiReq)}`);
 				upstream = await fetch("https://api.openai.com/v1/chat/completions", {
 					method: "POST",
 					headers: oaiHeaders,
