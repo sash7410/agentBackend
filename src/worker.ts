@@ -1,5 +1,6 @@
 import {
 	mapOAItoAnthropic,
+	mapOAItoAnthropicNoTools,
 	mapOAItoOpenAI,
 	mapOAItoOpenAIResponses,
 	anthropicSSEtoOAIChunks,
@@ -11,6 +12,11 @@ import {
 export interface Env {
 	ANTHROPIC_API_KEY: string;
 	OPENAI_API_KEY: string;
+	// Toggle to allow Claude tool use; default off
+	ANTHROPIC_ENABLE_TOOLS?: string;
+	// Optional SSE debug flags
+	DEBUG_SSE_EVENTS?: string;
+	DEBUG_SSE_VERBOSE?: string;
 }
 
 //TODO: lolol what is this?
@@ -138,6 +144,14 @@ export default {
 			console.log(
 				`[${requestId}] route=anthropic model=${model} enableThinking=${clientDefaults.enableAnthropicThinking}`,
 			);
+			// Opt-in SSE event logging (redacted)
+			const debugSSE =
+				((req.headers.get("x-debug-sse") || "").toLowerCase() === "true") ||
+				((env?.DEBUG_SSE_EVENTS || "").toLowerCase() === "true");
+			// Optional: include full event data (unredacted), server-side controlled
+			const debugSSEVerbose =
+				((req.headers.get("x-debug-sse-verbose") || "").toLowerCase() === "true") ||
+				((env?.DEBUG_SSE_VERBOSE || "").toLowerCase() === "true");
 			// Anthropic route:
 			// - We only support streaming for Anthropic in this minimal proxy
 			if (!stream) {
@@ -147,7 +161,7 @@ export default {
 			// Inject Anthropic thinking when the client mapping marks this model as redacted_thinking
 			if (clientDefaults.enableAnthropicThinking && !(body as any)?.thinking) {
 				// Ensure Anthropic extended thinking includes a required budget
-				const DEFAULT_THINKING_BUDGET = 1024;
+				const DEFAULT_THINKING_BUDGET = 16000;
 				body = {
 					...(body as any),
 					thinking: {
@@ -161,7 +175,9 @@ export default {
 			// STEP A: Map incoming OpenAI-style request to Anthropic Messages API
 			let mapped;
 			try {
-				mapped = mapOAItoAnthropic(body);
+				const enableTools = (env?.ANTHROPIC_ENABLE_TOOLS || "").toLowerCase() === "true";
+				// Disable tools by default for Claude to avoid stop_reason=tool_use without a handler
+				mapped = enableTools ? mapOAItoAnthropic(body) : mapOAItoAnthropicNoTools(body);
 			} catch (err: any) {
 				return oaiErrorEnvelope(err?.message ?? "Invalid request", null, 400);
 			}
@@ -223,7 +239,13 @@ export default {
 			
 
 			// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
-			const translated = anthropicSSEtoOAIChunks(model, upstream.body, `[${requestId}] provider=anthropic model=${model}`);
+			const translated = anthropicSSEtoOAIChunks(
+				model,
+				upstream.body,
+				`[${requestId}] provider=anthropic model=${model}`,
+				debugSSE,
+				debugSSEVerbose,
+			);
 
 			// Prepare OpenAI-style SSE response headers
 			const sseHeaders = new Headers();
@@ -359,7 +381,34 @@ export default {
 					);
 				}
 				const json = await upstream.text();
-				console.log(`[${requestId}] upstream<-openai-responses json_len=${json.length}`);
+				try {
+					let reasoningPresent = false;
+					let outputTextPresent = false;
+					try {
+						const obj = JSON.parse(json);
+						// Heuristic scan for reasoning-related fields without logging contents
+						const scan = (o: any): void => {
+							if (!o || typeof o !== "object") return;
+							for (const k of Object.keys(o)) {
+								const lk = k.toLowerCase();
+								if (lk.includes("reasoning") || lk.includes("thought")) reasoningPresent = true;
+								if (lk.includes("output_text") || (lk === "content" && typeof (o as any)[k] === "string")) {
+									outputTextPresent = true;
+								}
+								const v = (o as any)[k];
+								if (v && typeof v === "object") scan(v);
+							}
+						};
+						scan(obj);
+					} catch {
+						// ignore JSON parse errors for logging scan
+					}
+					console.log(
+						`[${requestId}] upstream<-openai-responses json_len=${json.length} reasoning_present=${reasoningPresent} output_text_present=${outputTextPresent}`,
+					);
+				} catch {
+					console.log(`[${requestId}] upstream<-openai-responses json_len=${json.length} (scan_failed)`);
+				}
 				return new Response(json, { status: 200, headers: { "content-type": "application/json" } });
 			}
 		}

@@ -137,8 +137,8 @@ export function computeDefaultReasoningForClientModel(clientModelId: string): {
 	return { provider, upstreamModel, sendToResponses, defaultEffort, enableAnthropicThinking };
 }
 
-const MAX_TOKENS_CAP = 8192;
-const DEFAULT_MAX_TOKENS = 1024;
+const MAX_TOKENS_CAP = 20000;
+const DEFAULT_MAX_TOKENS = 20000;
 
 function clamp(num: number, min: number, max: number): number {
 	if (num === null || num === undefined) return min;
@@ -388,6 +388,58 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 	};
 }
 
+	// Variant that disables tools for Anthropic entirely (drops tools and tool_* content)
+	export function mapOAItoAnthropicNoTools(req: ChatCompletionRequest): { request: AnthropicRequest; warnIgnoredTools: boolean } {
+		if (!req || typeof req !== "object") {
+			throw new Error("Invalid request body");
+		}
+		if (!Array.isArray(req.messages) || typeof req.model !== "string") {
+			throw new Error("Missing required fields: model, messages");
+		}
+		// Strip tool roles and tool_calls by converting to plain user/assistant text messages
+		const { system, filtered } = extractSystemAndFilterMessages({
+			...req,
+			tools: undefined, // ensure tools are considered absent
+		} as ChatCompletionRequest);
+		if (!ensureHasUserMessage(
+			(filtered as any as OAIMessage[]).map((m: any) => {
+				return { role: m.role, content: typeof m.content === "string" ? m.content : "" } as OAIMessage;
+			}),
+		)) {
+			throw new Error("At least one user message is required");
+		}
+		const temperature = req.temperature !== null && req.temperature !== undefined ? clamp(req.temperature, 0, 2) : undefined;
+		const maxTokens = selectMaxTokens(req, "anthropic") ?? DEFAULT_MAX_TOKENS;
+		const stop_sequences = Array.isArray(req.stop) && req.stop.length > 0 ? req.stop.slice(0) : undefined;
+		const stream = req.stream === null || req.stream === undefined ? true : Boolean(req.stream);
+
+		const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
+			? "claude-sonnet-4-5"
+			: req.model;
+		console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
+
+		// If client sent tools, we ignored them here
+		const ignored = Array.isArray((req as any).tools) && (req as any).tools.length > 0;
+
+		return {
+			request: {
+				model: mappedModel,
+				system,
+				messages: filtered,
+				max_tokens: maxTokens,
+				temperature,
+				stop_sequences,
+				stream,
+				tools: undefined,
+				thinking:
+					((req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929" && (req as any)?.thinking)
+						? { type: "enabled", ...(req as any).thinking }
+						: undefined,
+			},
+			warnIgnoredTools: ignored,
+		};
+	}
+
 export function mapOAItoOpenAI(req: ChatCompletionRequest): OpenAIChatRequest {
 	if (!req || typeof req !== "object") {
 		throw new Error("Invalid request body");
@@ -596,6 +648,8 @@ export function anthropicSSEtoOAIChunks(
 	model: string,
 	upstream: ReadableStream<Uint8Array>,
 	debugPrefix?: string,
+	debugEvents?: boolean,
+	debugVerbose?: boolean,
 ): ReadableStream<Uint8Array> {
 	// This function converts Anthropic's streaming events (SSE)
 	// into OpenAI-style "chat.completion.chunk" SSE frames.
@@ -621,6 +675,41 @@ export function anthropicSSEtoOAIChunks(
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
 			const reader = upstream.getReader();
+
+			function redactAnthropicData(input: any): any {
+				try {
+					if (input === null || input === undefined) return input;
+					if (typeof input === "string") {
+						return ""; // scrub direct strings
+					}
+					if (Array.isArray(input)) {
+						return input.map((v) => redactAnthropicData(v));
+					}
+					if (typeof input === "object") {
+						const out: Record<string, any> = {};
+						for (const key of Object.keys(input)) {
+							const val = (input as any)[key];
+							if (typeof val === "string") {
+								const lower = key.toLowerCase();
+								if (lower === "thinking" || lower === "text" || lower === "signature") {
+									out[`${key}_len`] = val.length;
+									out[key] = "";
+								} else {
+									out[key] = "";
+								}
+							} else if (val && typeof val === "object") {
+								out[key] = redactAnthropicData(val);
+							} else {
+								out[key] = val;
+							}
+						}
+						return out;
+					}
+					return input;
+				} catch {
+					return { _redaction: "failed" };
+				}
+			}
 
 			function pushAssistantRoleIfNeeded() {
 				if (!sentRole) {
@@ -658,6 +747,19 @@ export function anthropicSSEtoOAIChunks(
 					const events = parseSSELines(seg + "\n\n");
 					for (const e of events) {
 						eventCount++;
+						if (debugEvents) {
+							try {
+								const dataForLog = debugVerbose ? e.data : redactAnthropicData(e.data);
+								// Prefixed line for correlation
+								if (debugPrefix) console.log(`${debugPrefix} event: ${e.event}`);
+								// Strict event/data lines to match docs
+								console.log(`event: ${e.event}`);
+								console.log(`data: ${JSON.stringify(dataForLog)}`);
+								console.log("");
+							} catch {
+								// ignore logging errors
+							}
+						}
 						if (e.event === "message_start") {
 							if (debugPrefix) {
 								console.log(`${debugPrefix} translator: event#${eventCount} message_start`);
@@ -665,6 +767,17 @@ export function anthropicSSEtoOAIChunks(
 							pushAssistantRoleIfNeeded();
 						} else if (e.event === "content_block_delta") {
 							pushAssistantRoleIfNeeded();
+							// If Anthropic emits non-text deltas (e.g., thinking), surface that fact in logs
+							if (debugPrefix) {
+								try {
+									const deltaType = (e as any)?.data?.delta?.type || (e as any)?.data?.type;
+									if (deltaType && deltaType !== "text") {
+										console.log(`${debugPrefix} translator: event#${eventCount} non-text delta type=${deltaType}`);
+									}
+								} catch {
+									// ignore logging errors
+								}
+							}
 							const textDelta = e.data?.delta?.text ?? "";
 							if (debugPrefix) {
 								console.log(
@@ -823,6 +936,21 @@ export function responsesSSEtoOAIChunks(
 						if (debugPrefix) {
 							// Log only event names to avoid leaking content
 							console.log(`${debugPrefix} resp-translator: event#${eventCount} ${ev}`);
+							// Detect and surface reasoning-related signals without logging content
+							try {
+								const hasReasoningSignal =
+									(ev && ev.toLowerCase().includes("reasoning")) ||
+									(typeof data === "object" &&
+										data !== null &&
+										("reasoning" in data ||
+											"thoughts" in (data as any) ||
+											(data as any)?.type === "reasoning"));
+								if (hasReasoningSignal) {
+									console.log(`${debugPrefix} resp-translator: reasoning signal observed in event ${ev}`);
+								}
+							} catch {
+								// ignore logging errors
+							}
 						}
 						// Stream text deltas
 						if (ev.includes("output_text.delta") || typeof data?.delta === "string") {
