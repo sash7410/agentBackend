@@ -1,0 +1,244 @@
+import {
+	AnthropicContentBlock,
+	AnthropicMessage,
+	AnthropicRequest,
+	AnthropicToolDef,
+	ChatCompletionRequest,
+	OAIMessage,
+} from "../types";
+import { clamp, DEFAULT_MAX_TOKENS, selectMaxTokens } from "../utils/tokens";
+
+export function stripAnthropicDateSuffix(model: string): string {
+	return (model || "").replace(/-\d{8}$/, "");
+}
+
+function ensureHasUserMessage(messages: OAIMessage[]): boolean {
+	return messages.some((m) => m.role === "user");
+}
+
+function normalizeContentToText(content: any): { text: string; changed: boolean } {
+	if (typeof content === "string") return { text: content, changed: false };
+	if (Array.isArray(content)) {
+		const texts: string[] = [];
+		for (const part of content) {
+			if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+				texts.push(part.text);
+			}
+		}
+		return { text: texts.join(""), changed: true };
+	}
+	return { text: String(content ?? ""), changed: true };
+}
+
+function mapOpenAIToolsToAnthropic(tools: any[] | null | undefined): AnthropicToolDef[] | undefined {
+	if (!Array.isArray(tools) || tools.length === 0) return undefined;
+	const out: AnthropicToolDef[] = [];
+	for (const t of tools) {
+		try {
+			if (t && (t.type === "function" || t.function)) {
+				const fn = t.function ?? {};
+				const name = fn.name ?? t.name;
+				if (typeof name !== "string" || name.length === 0) continue;
+				const description = typeof fn.description === "string" ? fn.description : t.description;
+				const input_schema = fn.parameters ?? { type: "object" };
+				out.push({ name, description, input_schema });
+			}
+		} catch {
+			// ignore malformed tool
+		}
+	}
+	return out.length > 0 ? out : undefined;
+}
+
+function toAnthropicMessagesWithTools(req: ChatCompletionRequest): {
+	system?: string;
+	messages: AnthropicMessage[];
+	hadAnyToolsSignal: boolean;
+	anthropicTools?: AnthropicToolDef[];
+} {
+	let systemText: string | undefined = req.system ?? undefined;
+	const messages: AnthropicMessage[] = [];
+	const anthropicTools = mapOpenAIToolsToAnthropic(req.tools);
+	let hadAnyToolsSignal = Array.isArray(req.tools) && req.tools.length > 0;
+
+	for (const raw of req.messages || []) {
+		const msg: any = raw as any;
+		const role: string = msg.role;
+
+		if (role === "system") {
+			if (!systemText) {
+				const norm = normalizeContentToText(msg.content);
+				systemText = norm.text;
+			}
+			continue;
+		}
+
+		if (role === "assistant") {
+			const toolCalls: any[] | undefined = Array.isArray(msg.tool_calls) ? msg.tool_calls : undefined;
+			if (toolCalls && toolCalls.length > 0) {
+				hadAnyToolsSignal = true;
+				const blocks: AnthropicContentBlock[] = [];
+				const norm = normalizeContentToText(msg.content);
+				if (norm.text && norm.text.trim().length > 0) {
+					blocks.push({ type: "text", text: norm.text });
+				}
+				for (const tc of toolCalls) {
+					const id: string =
+						typeof tc.id === "string" && tc.id.length > 0 ? tc.id : `toolu_${Math.random().toString(36).slice(2, 10)}`;
+					const name: string = tc.function?.name ?? tc.name;
+					let input: any = {};
+					const argStr = tc.function?.arguments ?? tc.arguments;
+					if (typeof argStr === "string") {
+						try {
+							input = JSON.parse(argStr);
+						} catch {
+							input = { __raw: argStr };
+						}
+					} else if (argStr && typeof argStr === "object") {
+						input = argStr;
+					}
+					if (typeof name === "string" && name.length > 0) {
+						blocks.push({ type: "tool_use", id, name, input });
+					}
+				}
+				messages.push({ role: "assistant", content: blocks });
+				continue;
+			}
+			const norm = normalizeContentToText(msg.content);
+			messages.push({ role: "assistant", content: norm.text });
+			continue;
+		}
+
+		if (role === "tool") {
+			hadAnyToolsSignal = true;
+			const toolUseId: string | undefined = msg.tool_call_id || msg.tool_call_id?.toString?.();
+			const norm = normalizeContentToText(msg.content);
+			const block: AnthropicContentBlock = {
+				type: "tool_result",
+				tool_use_id: toolUseId ?? "",
+				content: norm.text ? [{ type: "text", text: norm.text }] : undefined,
+			};
+			messages.push({ role: "user", content: [block] });
+			continue;
+		}
+
+		if (role === "user") {
+			const norm = normalizeContentToText(msg.content);
+			messages.push({ role: "user", content: norm.text });
+			continue;
+		}
+	}
+
+	return { system: systemText, messages, hadAnyToolsSignal, anthropicTools };
+}
+
+function extractSystemAndFilterMessages(req: ChatCompletionRequest): {
+	system?: string;
+	filtered: AnthropicMessage[];
+	hadTools: boolean;
+} {
+	const providedSystem = req.system ?? undefined;
+	let systemText = providedSystem;
+	const filtered: AnthropicMessage[] = [];
+	const hadTools = Array.isArray(req.tools) && req.tools.length > 0;
+
+	for (const msg of req.messages || []) {
+		if (msg.role === "system") {
+			if (!systemText) {
+				const norm = normalizeContentToText((msg as any).content);
+				systemText = norm.text;
+			}
+			continue;
+		}
+		if (msg.role === "tool") {
+			continue;
+		}
+		if (msg.role === "user" || msg.role === "assistant") {
+			const norm = normalizeContentToText((msg as any).content);
+			filtered.push({ role: msg.role, content: norm.text });
+		}
+	}
+	return { system: systemText, filtered, hadTools };
+}
+
+export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: AnthropicRequest; warnIgnoredTools: boolean } {
+	if (!req || typeof req !== "object") {
+		throw new Error("Invalid request body");
+	}
+	if (!Array.isArray(req.messages) || typeof req.model !== "string") {
+		throw new Error("Missing required fields: model, messages");
+	}
+	const conv = toAnthropicMessagesWithTools(req);
+	if (
+		!ensureHasUserMessage(
+			(conv.messages as any as OAIMessage[]).map((m: any) => {
+				return { role: m.role, content: typeof m.content === "string" ? m.content : "" } as OAIMessage;
+			}),
+		)
+	) {
+		throw new Error("At least one user message is required");
+	}
+	const temperature = req.temperature !== null && req.temperature !== undefined ? clamp(req.temperature, 0, 2) : undefined;
+	const maxTokens = selectMaxTokens(req, "anthropic") ?? DEFAULT_MAX_TOKENS;
+	const stop_sequences = Array.isArray(req.stop) && req.stop.length > 0 ? req.stop.slice(0) : undefined;
+	const stream = req.stream === null || req.stream === undefined ? true : Boolean(req.stream);
+	const mappedModel = stripAnthropicDateSuffix(req.model);
+	return {
+		request: {
+			model: mappedModel,
+			system: conv.system,
+			messages: conv.messages,
+			max_tokens: maxTokens,
+			temperature,
+			stop_sequences,
+			stream,
+			tools: conv.anthropicTools,
+			thinking: (req as any)?.thinking ? { type: "enabled", ...(req as any).thinking } : undefined,
+		},
+		warnIgnoredTools: false,
+	};
+}
+
+export function mapOAItoAnthropicNoTools(req: ChatCompletionRequest): { request: AnthropicRequest; warnIgnoredTools: boolean } {
+	if (!req || typeof req !== "object") {
+		throw new Error("Invalid request body");
+	}
+	if (!Array.isArray(req.messages) || typeof req.model !== "string") {
+		throw new Error("Missing required fields: model, messages");
+	}
+	const { system, filtered } = extractSystemAndFilterMessages({
+		...req,
+		tools: undefined,
+	} as ChatCompletionRequest);
+	if (
+		!ensureHasUserMessage(
+			(filtered as any as OAIMessage[]).map((m: any) => {
+				return { role: m.role, content: typeof m.content === "string" ? m.content : "" } as OAIMessage;
+			}),
+		)
+	) {
+		throw new Error("At least one user message is required");
+	}
+	const temperature = req.temperature !== null && req.temperature !== undefined ? clamp(req.temperature, 0, 2) : undefined;
+	const maxTokens = selectMaxTokens(req, "anthropic") ?? DEFAULT_MAX_TOKENS;
+	const stop_sequences = Array.isArray(req.stop) && req.stop.length > 0 ? req.stop.slice(0) : undefined;
+	const stream = req.stream === null || req.stream === undefined ? true : Boolean(req.stream);
+	const mappedModel = stripAnthropicDateSuffix(req.model);
+	const ignored = Array.isArray((req as any).tools) && (req as any).tools.length > 0;
+	return {
+		request: {
+			model: mappedModel,
+			system,
+			messages: filtered,
+			max_tokens: maxTokens,
+			temperature,
+			stop_sequences,
+			stream,
+			tools: undefined,
+			thinking: (req as any)?.thinking ? { type: "enabled", ...(req as any).thinking } : undefined,
+		},
+		warnIgnoredTools: ignored,
+	};
+}
+
+

@@ -49,7 +49,6 @@ function oaiErrorEnvelope(message: string, code: string | number | null = null, 
 
 export default {
 	async fetch(req: Request, env: Env, ctx: WorkerExecutionContext): Promise<Response> {
-		console.log(`lolol`);
 		// Assign a short random request id for easy log correlation
 		function headersToObject(h: Headers): Record<string, string> {
 			const obj: Record<string, string> = {};
@@ -477,7 +476,6 @@ export default {
 			let upstream: Response;
 			try {
 				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=false`);
-				console.log(`[${requestId}] openaiReq=${JSON.stringify(openaiReq)}`);
 				upstream = await fetch("https://api.openai.com/v1/chat/completions", {
 					method: "POST",
 					headers: oaiHeaders,
