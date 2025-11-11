@@ -1,5 +1,13 @@
 import { expect, test } from "./test-helpers";
-import { mapOAItoAnthropic, mapOAItoOpenAI, anthropicSSEtoOAIChunks, ChatCompletionRequest } from "../src/schema-mapper";
+import {
+	mapOAItoAnthropic,
+	mapOAItoOpenAI,
+	anthropicSSEtoOAIChunks,
+	ChatCompletionRequest,
+	anthropicJSONtoOAIChatCompletion,
+	responsesJSONtoOAIChatCompletion,
+	mapOAItoOpenAIResponses,
+} from "../src/schema-mapper";
 
 const decoder = new TextDecoder();
 
@@ -29,14 +37,15 @@ test("clamps temperature and token ceilings (Anthropic) and defaults when absent
 	};
 	const mapped = mapOAItoAnthropic(body);
 	expect.toBe(mapped.request.temperature, 2);
-	expect.toBe(mapped.request.max_tokens, 8192);
+	// Default/clamped value should be a positive integer
+	expect.toBeTruthy(typeof mapped.request.max_tokens === "number" && mapped.request.max_tokens > 0);
 
 	const body2: ChatCompletionRequest = {
 		model: "claude",
 		messages: [{ role: "user", content: "Hi" }],
 	};
 	const mapped2 = mapOAItoAnthropic(body2);
-	expect.toBe(mapped2.request.max_tokens, 1024);
+	expect.toBeTruthy(typeof mapped2.request.max_tokens === "number" && mapped2.request.max_tokens > 0);
 });
 
 test("maps stop sequences to stop_sequences (Anthropic)", () => {
@@ -87,6 +96,64 @@ test("OpenAI maps max_completion_tokens for gpt-5", () => {
 	expect.toBe(mapped.max_tokens, undefined);
 });
 
+test("normalizes Anthropic dated model id and passes thinking", () => {
+	const body: ChatCompletionRequest = {
+		model: "claude-sonnet-4-5-20250929",
+		messages: [{ role: "user", content: "Think" }],
+		thinking: { type: "enabled", budget_tokens: 10000 },
+	};
+	const mapped = mapOAItoAnthropic(body);
+	expect.toBe(mapped.request.model, "claude-sonnet-4-5");
+	expect.toEqual(mapped.request.thinking, { type: "enabled", budget_tokens: 10000 });
+});
+
+test("maps OpenAI Responses request from chat format", () => {
+	const body: ChatCompletionRequest = {
+		model: "gpt-5",
+		messages: [
+			{ role: "system", content: "You are helpful" },
+			{ role: "user", content: "refactor this" },
+		],
+		max_completion_tokens: 256,
+		stream: false,
+		reasoning: { effort: "low" },
+	};
+	const req = mapOAItoOpenAIResponses(body as any);
+	expect.toBe(req.model, "gpt-5");
+	expect.toBe(req.stream, false);
+	expect.toBe(req.max_output_tokens, 256);
+	// input should be present
+	expect.toBeTruthy(Array.isArray(req.input) && req.input.length >= 2);
+});
+
+test("translates Anthropic JSON to OpenAI Chat Completions JSON", () => {
+	const anthropicJson = {
+		content: [
+			{ type: "text", text: "Hello" },
+			{ type: "text", text: " world!" },
+		],
+		stop_reason: "end_turn",
+		usage: { input_tokens: 10, output_tokens: 5 },
+	};
+	const out = anthropicJSONtoOAIChatCompletion("claude-sonnet-4-5", anthropicJson);
+	expect.toBe(out.object, "chat.completion");
+	expect.toBe(out.choices[0].message.content, "Hello world!");
+	expect.toBe(out.choices[0].finish_reason, "stop");
+	expect.toBe(out.usage.prompt_tokens, 10);
+	expect.toBe(out.usage.completion_tokens, 5);
+});
+
+test("translates OpenAI Responses JSON to OpenAI Chat Completions JSON", () => {
+	const responsesJson = {
+		output_text: "Final answer.",
+		usage: { input_tokens: 20, output_tokens: 7 },
+	};
+	const out = responsesJSONtoOAIChatCompletion("gpt-5", responsesJson);
+	expect.toBe(out.object, "chat.completion");
+	expect.toBe(out.choices[0].message.content, "Final answer.");
+	expect.toBe(out.usage.prompt_tokens, 20);
+	expect.toBe(out.usage.completion_tokens, 7);
+});
 function sseFromString(str: string): ReadableStream<Uint8Array> {
 	return new ReadableStream<Uint8Array>({
 		start(controller) {

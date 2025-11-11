@@ -7,6 +7,8 @@ import {
 	responsesSSEtoOAIChunks,
 	ChatCompletionRequest,
 	computeDefaultReasoningForClientModel,
+	anthropicJSONtoOAIChatCompletion,
+	responsesJSONtoOAIChatCompletion,
 } from "./schema-mapper";
 
 export interface Env {
@@ -154,14 +156,12 @@ export default {
 				((env?.DEBUG_SSE_VERBOSE || "").toLowerCase() === "true");
 			// Anthropic route:
 			// - We only support streaming for Anthropic in this minimal proxy
-			if (!stream) {
-				return oaiErrorEnvelope("Anthropic non-streaming is not supported in v1. Please set stream=true.", null, 400);
-			}
+			// Support both streaming and non-streaming flows
 
 			// Inject Anthropic thinking when the client mapping marks this model as redacted_thinking
 			if (clientDefaults.enableAnthropicThinking && !(body as any)?.thinking) {
 				// Ensure Anthropic extended thinking includes a required budget
-				const DEFAULT_THINKING_BUDGET = 16000;
+				const DEFAULT_THINKING_BUDGET = 10000;
 				body = {
 					...(body as any),
 					thinking: {
@@ -185,12 +185,11 @@ export default {
 			// 	`[${requestId}] mapped->anthropic system=${mapped.request.system ? true : false} msgs=${mapped.request.messages.length} max_tokens=${mapped.request.max_tokens} stop=${mapped.request.stop_sequences?.length ?? 0} temp=${mapped.request.temperature ?? "n/a"} warnTools=${mapped.warnIgnoredTools}`,
 			// );
 
-			// STEP B: Call Anthropic with streaming enabled
+			// STEP B: Call Anthropic with streaming or non-streaming based on client request
 			const headers: Record<string, string> = {
 				"content-type": "application/json",
 				"anthropic-version": "2023-06-01",
 				"x-api-key": env.ANTHROPIC_API_KEY,
-				accept: "text/event-stream",
 			};
 			// AFTER: Log full outbound request to Anthropic (method, URL, headers, mapped body)
 			try {
@@ -199,84 +198,112 @@ export default {
 					method: "POST",
 					url: "https://api.anthropic.com/v1/messages",
 					headers,
-					body: mapped.request,
+					body: { ...mapped.request, stream },
 				};
 				console.log(`[${requestId}] AFTER request ${JSON.stringify(afterAnthropic)}`);
 			} catch (e) {
 				console.log(`[${requestId}] AFTER request log error (anthropic)`);
 			}
 
-			let upstream: Response;
-			try {
-                // console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
-				// console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
-				upstream = await fetch("https://api.anthropic.com/v1/messages", {
-					method: "POST",
-					headers,
-					body: JSON.stringify(mapped.request),
+			if (stream) {
+				let upstream: Response;
+				try {
+					headers["accept"] = "text/event-stream";
+					// console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
+					// console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
+					upstream = await fetch("https://api.anthropic.com/v1/messages", {
+						method: "POST",
+						headers,
+						body: JSON.stringify({ ...mapped.request, stream: true }),
+					});
+				} catch (e: any) {
+					console.log(`[${requestId}] upstream fetch error provider=anthropic model=${model}`);
+					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				}
+
+				// STEP C: Handle non-OK upstream response
+				if (!upstream.ok || !upstream.body) {
+					const text = await upstream.text().catch(() => "");
+					console.log(
+						`[${requestId}] upstream non-ok provider=anthropic status=${upstream.status} model=${model} body_len=${text.length}`,
+					);
+					return oaiErrorEnvelope(
+						`Upstream error (${upstream.status}). ${text || "Anthropic did not provide additional details."}`,
+						upstream.status,
+						502,
+					);
+				}
+
+				// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
+				const translated = anthropicSSEtoOAIChunks(
+					model,
+					upstream.body,
+					`[${requestId}] provider=anthropic model=${model}`,
+					debugSSE,
+					debugSSEVerbose,
+				);
+
+				// Prepare OpenAI-style SSE response headers
+				const sseHeaders = new Headers();
+				sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
+				sseHeaders.set("cache-control", "no-cache, no-transform");
+				sseHeaders.set("connection", "keep-alive");
+				if (mapped.warnIgnoredTools) {
+					sseHeaders.set("x-warn-ignored-tools", "true");
+				}
+
+				{
+					const hdrObj: Record<string, string> = {};
+					sseHeaders.forEach((value, key) => {
+						hdrObj[key] = value;
+					});
+					console.log(
+						`[${requestId}] streaming start provider=anthropic model=${model} hdrs=${JSON.stringify(hdrObj)}`,
+					);
+				}
+				// STEP E: Return the translated stream to the client
+				const response = new Response(translated, {
+					status: 200,
+					headers: sseHeaders,
 				});
-			} catch (e: any) {
-				console.log(`[${requestId}] upstream fetch error provider=anthropic model=${model}`);
-				return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
-			}
-
-			// STEP C: Handle non-OK upstream response
-			if (!upstream.ok || !upstream.body) {
-				const text = await upstream.text().catch(() => "");
-				console.log(
-					`[${requestId}] upstream non-ok provider=anthropic status=${upstream.status} model=${model} body_len=${text.length}`,
+				// Keep the worker alive while streaming; midstream errors are tolerated by clients
+				ctx.waitUntil(
+					(upstream.body as any)?.cancel?.().catch(() => {
+						// ignore
+					}),
 				);
-				return oaiErrorEnvelope(
-					`Upstream error (${upstream.status}). ${text || "Anthropic did not provide additional details."}`,
-					upstream.status,
-					502,
-				);
-			}
-			// const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
-			// ? "claude-sonnet-4-5"
-			// : req.model;
-			// console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
-			
-
-			// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
-			const translated = anthropicSSEtoOAIChunks(
-				model,
-				upstream.body,
-				`[${requestId}] provider=anthropic model=${model}`,
-				debugSSE,
-				debugSSEVerbose,
-			);
-
-			// Prepare OpenAI-style SSE response headers
-			const sseHeaders = new Headers();
-			sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
-			sseHeaders.set("cache-control", "no-cache, no-transform");
-			sseHeaders.set("connection", "keep-alive");
-			if (mapped.warnIgnoredTools) {
-				sseHeaders.set("x-warn-ignored-tools", "true");
-			}
-
-			{
-				const hdrObj: Record<string, string> = {};
-				sseHeaders.forEach((value, key) => {
-					hdrObj[key] = value;
+				return response;
+			} else {
+				let upstream: Response;
+				try {
+					// Non-stream Anthropic
+					upstream = await fetch("https://api.anthropic.com/v1/messages", {
+						method: "POST",
+						headers,
+						body: JSON.stringify({ ...mapped.request, stream: false }),
+					});
+				} catch (e: any) {
+					console.log(`[${requestId}] upstream fetch error provider=anthropic model=${model}`);
+					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				}
+				if (!upstream.ok) {
+					const text = await upstream.text().catch(() => "");
+					console.log(
+						`[${requestId}] upstream non-ok provider=anthropic status=${upstream.status} model=${model} body_len=${text.length}`,
+					);
+					return oaiErrorEnvelope(
+						`Upstream error (${upstream.status}). ${text || "Anthropic did not provide additional details."}`,
+						upstream.status,
+						502,
+					);
+				}
+				const raw = await upstream.json().catch(() => null as any);
+				const chat = anthropicJSONtoOAIChatCompletion(model, raw || {});
+				return new Response(JSON.stringify(chat), {
+					status: 200,
+					headers: { "content-type": "application/json" },
 				});
-				console.log(
-					`[${requestId}] streaming start provider=anthropic model=${model} hdrs=${JSON.stringify(hdrObj)}`,
-				);
 			}
-			// STEP E: Return the translated stream to the client
-			const response = new Response(translated, {
-				status: 200,
-				headers: sseHeaders,
-			});
-			// Keep the worker alive while streaming; midstream errors are tolerated by clients
-			ctx.waitUntil(
-				(upstream.body as any)?.cancel?.().catch(() => {
-					// ignore
-				}),
-			);
-			return response;
 		}
 
 		// OpenAI routing:
@@ -380,36 +407,9 @@ export default {
 						502,
 					);
 				}
-				const json = await upstream.text();
-				try {
-					let reasoningPresent = false;
-					let outputTextPresent = false;
-					try {
-						const obj = JSON.parse(json);
-						// Heuristic scan for reasoning-related fields without logging contents
-						const scan = (o: any): void => {
-							if (!o || typeof o !== "object") return;
-							for (const k of Object.keys(o)) {
-								const lk = k.toLowerCase();
-								if (lk.includes("reasoning") || lk.includes("thought")) reasoningPresent = true;
-								if (lk.includes("output_text") || (lk === "content" && typeof (o as any)[k] === "string")) {
-									outputTextPresent = true;
-								}
-								const v = (o as any)[k];
-								if (v && typeof v === "object") scan(v);
-							}
-						};
-						scan(obj);
-					} catch {
-						// ignore JSON parse errors for logging scan
-					}
-					console.log(
-						`[${requestId}] upstream<-openai-responses json_len=${json.length} reasoning_present=${reasoningPresent} output_text_present=${outputTextPresent}`,
-					);
-				} catch {
-					console.log(`[${requestId}] upstream<-openai-responses json_len=${json.length} (scan_failed)`);
-				}
-				return new Response(json, { status: 200, headers: { "content-type": "application/json" } });
+				const raw = await upstream.json().catch(() => null as any);
+				const chat = responsesJSONtoOAIChatCompletion(model, raw || {});
+				return new Response(JSON.stringify(chat), { status: 200, headers: { "content-type": "application/json" } });
 			}
 		}
 

@@ -170,6 +170,11 @@ function normalizeContentToText(content: any): { text: string; changed: boolean 
 	return { text: String(content ?? ""), changed: true };
 }
 
+function stripAnthropicDateSuffix(model: string): string {
+	// Normalize Anthropic models like "claude-sonnet-4-5-20250929" -> "claude-sonnet-4-5"
+	return (model || "").replace(/-\d{8}$/, "");
+}
+
 function mapOpenAIToolsToAnthropic(tools: any[] | null | undefined): AnthropicToolDef[] | undefined {
 	if (!Array.isArray(tools) || tools.length === 0) return undefined;
 	const out: AnthropicToolDef[] = [];
@@ -363,10 +368,8 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 
 	// We return Anthropic's native request shape, but we also return a flag if tools were present
 	// so the caller can attach a warning header for the client.
-	const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
-		? "claude-sonnet-4-5"
-		: req.model;
-		console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
+	const mappedModel = stripAnthropicDateSuffix(req.model);
+	console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
 	return {
 		request: {
 			model: mappedModel,
@@ -378,10 +381,7 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 			stream,
 			tools: conv.anthropicTools,
 			// Enable Anthropic extended thinking only for specific model(s)
-			thinking:
-				((req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929" && (req as any)?.thinking)
-					? { type: "enabled", ...(req as any).thinking }
-					: undefined,
+			thinking: (req as any)?.thinking ? { type: "enabled", ...(req as any).thinking } : undefined,
 		},
 		// Tools supported in this mapping
 		warnIgnoredTools: false,
@@ -413,9 +413,7 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 		const stop_sequences = Array.isArray(req.stop) && req.stop.length > 0 ? req.stop.slice(0) : undefined;
 		const stream = req.stream === null || req.stream === undefined ? true : Boolean(req.stream);
 
-		const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
-			? "claude-sonnet-4-5"
-			: req.model;
+		const mappedModel = stripAnthropicDateSuffix(req.model);
 		console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
 
 		// If client sent tools, we ignored them here
@@ -431,10 +429,7 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 				stop_sequences,
 				stream,
 				tools: undefined,
-				thinking:
-					((req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929" && (req as any)?.thinking)
-						? { type: "enabled", ...(req as any).thinking }
-						: undefined,
+				thinking: (req as any)?.thinking ? { type: "enabled", ...(req as any).thinking } : undefined,
 			},
 			warnIgnoredTools: ignored,
 		};
@@ -1017,6 +1012,100 @@ export function responsesSSEtoOAIChunks(
 			// no-op
 		},
 	});
+}
+
+export function anthropicJSONtoOAIChatCompletion(model: string, resp: any) {
+	const id = `chatcmpl_${Math.random().toString(36).slice(2)}`;
+	const created = Math.floor(Date.now() / 1000);
+	// Aggregate text from content blocks
+	let text = "";
+	if (typeof resp?.content === "string") {
+		text = resp.content;
+	} else if (Array.isArray(resp?.content)) {
+		for (const block of resp.content) {
+			if (block && typeof block === "object") {
+				if (block.type === "text" && typeof block.text === "string") {
+					text += block.text;
+				} else if (block.type === "tool_result") {
+					// ignore in minimal translator
+				}
+			}
+		}
+	}
+	const stop_reason = (resp?.stop_reason || "").toString();
+	const finish_reason = stop_reason === "end_turn" ? "stop" : stop_reason === "max_tokens" ? "length" : null;
+	const usage = resp?.usage || {};
+	const prompt_tokens = typeof usage?.input_tokens === "number" ? usage.input_tokens : null;
+	const completion_tokens = typeof usage?.output_tokens === "number" ? usage.output_tokens : null;
+	const total_tokens =
+		(prompt_tokens ?? 0) + (completion_tokens ?? 0);
+	return {
+		id,
+		object: "chat.completion",
+		created,
+		model,
+		choices: [
+			{
+				index: 0,
+				message: { role: "assistant", content: text || "" },
+				finish_reason,
+				logprobs: null,
+			},
+		],
+		usage: {
+			prompt_tokens,
+			completion_tokens,
+			total_tokens,
+		},
+	};
+}
+
+export function responsesJSONtoOAIChatCompletion(model: string, resp: any) {
+	const id = `chatcmpl_${Math.random().toString(36).slice(2)}`;
+	const created = Math.floor(Date.now() / 1000);
+	let text = "";
+	if (typeof resp?.output_text === "string") {
+		text = resp.output_text;
+	}
+	// Fallback: scan output array for message content text
+	if (!text && Array.isArray(resp?.output)) {
+		for (const item of resp.output) {
+			if (item?.type === "message" && Array.isArray(item?.content)) {
+				const parts = item.content
+					.filter((c: any) => c && typeof c === "object" && (c.type === "output_text" || c.type === "text"))
+					.map((c: any) => c.text)
+					.filter((s: any) => typeof s === "string");
+				if (parts.length > 0) {
+					text = parts.join("");
+					break;
+				}
+			}
+		}
+	}
+	const usage = resp?.usage || {};
+	const prompt_tokens = typeof usage?.input_tokens === "number" ? usage.input_tokens : null;
+	const completion_tokens = typeof usage?.output_tokens === "number" ? usage.output_tokens : null;
+	const total_tokens =
+		(prompt_tokens ?? 0) + (completion_tokens ?? 0);
+	return {
+		id,
+		object: "chat.completion",
+		created,
+		model,
+		choices: [
+			{
+				index: 0,
+				message: { role: "assistant", content: text || "" },
+				finish_reason: "stop",
+				logprobs: null,
+			},
+		],
+		usage: {
+			prompt_tokens,
+			completion_tokens,
+			total_tokens,
+		},
+	};
 }
 
 
