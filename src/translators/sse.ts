@@ -62,7 +62,7 @@ function parseSSELines(text: string): SSEEvent[] {
 
 export function anthropicSSEtoOAIChunks(
 	model: string,
-	upstream: ReadableStream<Uint8Array>,
+	downStreamResponse: ReadableStream<Uint8Array>,
 	debugPrefix?: string,
 	debugEvents?: boolean,
 	debugVerbose?: boolean,
@@ -86,7 +86,7 @@ export function anthropicSSEtoOAIChunks(
 
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
-			const reader = upstream.getReader();
+			const reader = downStreamResponse.getReader();
 
 			function redactAnthropicData(input: any): any {
 				try {
@@ -234,7 +234,7 @@ export function anthropicSSEtoOAIChunks(
 				try {
 					const chunkText = decoder.decode(result.value, { stream: true });
 					if (debugPrefix) {
-						console.log(`${debugPrefix} translator: received upstream bytes=${result.value?.length ?? 0}`);
+						console.log(`${debugPrefix} translator: received downStreamResponse bytes=${result.value?.length ?? 0}`);
 					}
 					processText(chunkText);
 				} catch {}
@@ -254,7 +254,7 @@ export function anthropicSSEtoOAIChunks(
 
 export function responsesSSEtoOAIChunks(
 	model: string,
-	upstream: ReadableStream<Uint8Array>,
+	downStreamResponse: ReadableStream<Uint8Array>,
 	debugPrefix?: string,
 ): ReadableStream<Uint8Array> {
 	const id = generateOpenAIChunkId();
@@ -276,7 +276,7 @@ export function responsesSSEtoOAIChunks(
 
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
-			const reader = upstream.getReader();
+			const reader = downStreamResponse.getReader();
 
 			function pushAssistantRoleIfNeeded() {
 				if (!sentRole) {
@@ -371,7 +371,7 @@ export function responsesSSEtoOAIChunks(
 				try {
 					const chunkText = decoder.decode(result.value, { stream: true });
 					if (debugPrefix) {
-						console.log(`${debugPrefix} resp-translator: received upstream bytes=${result.value?.length ?? 0}`);
+						console.log(`${debugPrefix} resp-translator: received downStreamResponse bytes=${result.value?.length ?? 0}`);
 					}
 					processText(chunkText);
 				} catch {}

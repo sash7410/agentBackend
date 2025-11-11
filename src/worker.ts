@@ -59,6 +59,7 @@ export default {
 		}
 		const url = new URL(req.url);
 		const requestId = Math.random().toString(36).slice(2, 10);
+		//TODO: lolol do not do this and use zod schema here
 			const normalizedPath = url.pathname.replace(/\/{2,}/g, "/");
 			const method = req.method.toUpperCase();
 			console.log(`[${requestId}] ingress method=${method} path=${url.pathname} normalized=${normalizedPath}`);
@@ -146,14 +147,14 @@ export default {
 				`[${requestId}] route=anthropic model=${model} enableThinking=${clientDefaults.enableAnthropicThinking}`,
 			);
 			// Opt-in SSE event logging (redacted)
-			const debugSSE =
-				((req.headers.get("x-debug-sse") || "").toLowerCase() === "true") ||
-				((env?.DEBUG_SSE_EVENTS || "").toLowerCase() === "true");
-			// Optional: include full event data (unredacted), server-side controlled
-			const debugSSEVerbose =
-				((req.headers.get("x-debug-sse-verbose") || "").toLowerCase() === "true") ||
-				((env?.DEBUG_SSE_VERBOSE || "").toLowerCase() === "true");
-			// Anthropic route:
+			// const debugSSE =
+			// 	((req.headers.get("x-debug-sse") || "").toLowerCase() === "true") ||
+			// 	((env?.DEBUG_SSE_EVENTS || "").toLowerCase() === "true");
+			// // Optional: include full event data (unredacted), server-side controlled
+			// const debugSSEVerbose =
+			// 	((req.headers.get("x-debug-sse-verbose") || "").toLowerCase() === "true") ||
+			// 	((env?.DEBUG_SSE_VERBOSE || "").toLowerCase() === "true");
+			// // Anthropic route:
 			// - We only support streaming for Anthropic in this minimal proxy
 			// Support both streaming and non-streaming flows
 
@@ -172,6 +173,7 @@ export default {
 			}
 
 			// STEP A: Map incoming OpenAI-style request to Anthropic Messages API
+			//TODO: lolol fix tooling issue in anthropic
 			let mapped;
 			try {
 				const enableTools = (env?.ANTHROPIC_ENABLE_TOOLS || "").toLowerCase() === "true";
@@ -192,43 +194,43 @@ export default {
 			};
 			// AFTER: Log full outbound request to Anthropic (method, URL, headers, mapped body)
 			try {
-				const afterAnthropic = {
-					upstream: "anthropic",
+				const afterConversionToAnthropic = {
+					provider: "anthropic",
 					method: "POST",
 					url: "https://api.anthropic.com/v1/messages",
 					headers,
 					body: { ...mapped.request, stream },
 				};
-				console.log(`[${requestId}] AFTER request ${JSON.stringify(afterAnthropic)}`);
+				console.log(`[${requestId}] AFTER request conversion for anthropic  ${JSON.stringify(afterConversionToAnthropic)}`);
 			} catch (e) {
-				console.log(`[${requestId}] AFTER request log error (anthropic)`);
+				console.log(`[${requestId}] AFTER request conversion for anthropic log error (anthropic)`);
 			}
 
 			if (stream) {
-				let upstream: Response;
+				let downStreamResponse: Response;
 				try {
 					headers["accept"] = "text/event-stream";
 					// console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
-					// console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
-					upstream = await fetch("https://api.anthropic.com/v1/messages", {
+					// console.log(`[${requestId}] downStreamResponse->anthropic POST /v1/messages stream=true`);
+					downStreamResponse = await fetch("https://api.anthropic.com/v1/messages", {
 						method: "POST",
 						headers,
 						body: JSON.stringify({ ...mapped.request, stream: true }),
 					});
 				} catch (e: any) {
-					console.log(`[${requestId}] upstream fetch error provider=anthropic model=${model}`);
-					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+					console.log(`[${requestId}] downStreamResponse fetch error provider=anthropic model=${model}`);
+					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
 
-				// STEP C: Handle non-OK upstream response
-				if (!upstream.ok || !upstream.body) {
-					const text = await upstream.text().catch(() => "");
+				// STEP C: Handle non-OK downStreamResponse response
+				if (!downStreamResponse.ok || !downStreamResponse.body) {
+					const text = await downStreamResponse.text().catch(() => "");
 					console.log(
-						`[${requestId}] upstream non-ok provider=anthropic status=${upstream.status} model=${model} body_len=${text.length}`,
+						`[${requestId}] downStreamResponse non-ok provider=anthropic status=${downStreamResponse.status} model=${model} body_len=${text.length}, request=${JSON.stringify(mapped.request)}`,
 					);
 					return oaiErrorEnvelope(
-						`Upstream error (${upstream.status}). ${text || "Anthropic did not provide additional details."}`,
-						upstream.status,
+						`downStream error (${downStreamResponse.status}). ${text || "Anthropic did not provide additional details."}`,
+						downStreamResponse.status,
 						502,
 					);
 				}
@@ -236,15 +238,16 @@ export default {
 				// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
 				const translated = anthropicSSEtoOAIChunks(
 					model,
-					upstream.body,
+					downStreamResponse.body,
 					`[${requestId}] provider=anthropic model=${model}`,
-					debugSSE,
-					debugSSEVerbose,
+				// 	debugSSE,
+				// 	debugSSEVerbose,
 				);
 
 				// Prepare OpenAI-style SSE response headers
 				const sseHeaders = new Headers();
 				sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
+				//TODO: lolol check for caching
 				sseHeaders.set("cache-control", "no-cache, no-transform");
 				sseHeaders.set("connection", "keep-alive");
 				if (mapped.warnIgnoredTools) {
@@ -267,36 +270,37 @@ export default {
 				});
 				// Keep the worker alive while streaming; midstream errors are tolerated by clients
 				ctx.waitUntil(
-					(upstream.body as any)?.cancel?.().catch(() => {
+					(downStreamResponse.body as any)?.cancel?.().catch(() => {
 						// ignore
 					}),
 				);
 				return response;
 			} else {
-				let upstream: Response;
+				let downStreamResponse: Response;
 				try {
 					// Non-stream Anthropic
-					upstream = await fetch("https://api.anthropic.com/v1/messages", {
+					downStreamResponse = await fetch("https://api.anthropic.com/v1/messages", {
 						method: "POST",
 						headers,
 						body: JSON.stringify({ ...mapped.request, stream: false }),
 					});
+					//TODO: lolol does this have to be non-streaming?
 				} catch (e: any) {
-					console.log(`[${requestId}] upstream fetch error provider=anthropic model=${model}`);
-					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+					console.log(`[${requestId}] downStream fetch error provider=anthropic model=${model}`);
+					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
-				if (!upstream.ok) {
-					const text = await upstream.text().catch(() => "");
+				if (!downStreamResponse.ok) {
+					const text = await downStreamResponse.text().catch(() => "");
 					console.log(
-						`[${requestId}] upstream non-ok provider=anthropic status=${upstream.status} model=${model} body_len=${text.length}`,
+						`[${requestId}] downStreamResponse non-ok provider=anthropic status=${downStreamResponse.status} model=${model} body_len=${text.length}, request=${JSON.stringify(mapped.request)}`,
 					);
 					return oaiErrorEnvelope(
-						`Upstream error (${upstream.status}). ${text || "Anthropic did not provide additional details."}`,
-						upstream.status,
+						`downStreamResponse error (${downStreamResponse.status}). ${text || "Anthropic did not provide additional details."}`,
+						downStreamResponse.status,
 						502,
 					);
 				}
-				const raw = await upstream.json().catch(() => null as any);
+				const raw = await downStreamResponse.json().catch(() => null as any);
 				const chat = anthropicJSONtoOAIChatCompletion(model, raw || {});
 				return new Response(JSON.stringify(chat), {
 					status: 200,
@@ -331,39 +335,39 @@ export default {
 				return oaiErrorEnvelope(err?.message ?? "Invalid request", null, 400);
 			}
 			try {
-				const afterOpenAI = {
-					upstream: "openai",
+				const afterConversionToOpenAIResponses = {
+					provider: "openai",
 					method: "POST",
 					url: "https://api.openai.com/v1/responses",
 					headers: oaiHeaders,
 					body: responsesReq,
 				};
-				console.log(`[${requestId}] AFTER request for reasoning model ${JSON.stringify(afterOpenAI)}`);
+				console.log(`[${requestId}] AFTER request for reasoning model ${JSON.stringify(afterConversionToOpenAIResponses)}`);
 			} catch (e) {
 				console.log(`[${requestId}] AFTER request log error (openai-responses)`);
 			}
 
 			if (responsesReq.stream) {
-				let upstream: Response;
+				let downStreamResponse: Response;
 				try {
-					console.log(`[${requestId}] upstream->openai POST /v1/responses stream=true`);
-					upstream = await fetch("https://api.openai.com/v1/responses", {
+					console.log(`[${requestId}] downStreamResponse->openai POST /v1/responses stream=true`);
+					downStreamResponse = await fetch("https://api.openai.com/v1/responses", {
 						method: "POST",
 						headers: oaiHeaders,
 						body: JSON.stringify(responsesReq),
 					});
 				} catch (e: any) {
-					console.log(`[${requestId}] upstream fetch error provider=openai-responses model=${model}`);
-					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+					console.log(`[${requestId}] downStream fetch error provider=openai-responses model=${model}`);
+					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
-				if (!upstream.ok || !upstream.body) {
-					const text = await upstream.text().catch(() => "");
+				if (!downStreamResponse.ok || !downStreamResponse.body) {
+					const text = await downStreamResponse.text().catch(() => "");
 					console.log(
-						`[${requestId}] upstream non-ok provider=openai-responses status=${upstream.status} model=${model} body_len=${text.length}`,
+						`[${requestId}] downStreamResponse non-ok provider=openai-responses status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
 					);
 					return oaiErrorEnvelope(
-						`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
-						upstream.status,
+						`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
+						downStreamResponse.status,
 						502,
 					);
 				}
@@ -378,35 +382,35 @@ export default {
 				const translated = responsesSSEtoOAIChunks(
 					// Preserve the client-requested model id in SSE for client compatibility
 					model,
-					upstream.body,
+					downStreamResponse.body,
 					`[${requestId}] provider=openai-responses model=${responsesReq.model}`,
 				);
 				return new Response(translated, { status: 200, headers: sseHeaders });
 			} else {
-				let upstream: Response;
+				let downStreamResponse: Response;
 				try {
-					console.log(`[${requestId}] upstream->openai POST /v1/responses stream=false`);
-					upstream = await fetch("https://api.openai.com/v1/responses", {
+					console.log(`[${requestId}] downStreamResponse->openai POST /v1/responses stream=false`);
+					downStreamResponse = await fetch("https://api.openai.com/v1/responses", {
 						method: "POST",
 						headers: oaiHeaders,
 						body: JSON.stringify(responsesReq),
 					});
 				} catch (e: any) {
-					console.log(`[${requestId}] upstream fetch error provider=openai-responses model=${model}`);
-					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+					console.log(`[${requestId}] downStream fetch error provider=openai-responses model=${model}`);
+					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
-				if (!upstream.ok) {
-					const text = await upstream.text().catch(() => "");
+				if (!downStreamResponse.ok) {
+					const text = await downStreamResponse.text().catch(() => "");
 					console.log(
-						`[${requestId}] upstream non-ok provider=openai-responses status=${upstream.status} model=${model} body_len=${text.length}`,
+						`[${requestId}] downStreamResponse non-ok provider=openai-responses status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
 					);
 					return oaiErrorEnvelope(
-						`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
-						upstream.status,
+						`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
+						downStreamResponse.status,
 						502,
 					);
 				}
-				const raw = await upstream.json().catch(() => null as any);
+				const raw = await downStreamResponse.json().catch(() => null as any);
 				const chat = responsesJSONtoOAIChatCompletion(model, raw || {});
 				return new Response(JSON.stringify(chat), { status: 200, headers: { "content-type": "application/json" } });
 			}
@@ -423,38 +427,38 @@ export default {
 			`[${requestId}] mapped->openai msgs=${openaiReq.messages.length} max=${openaiReq.max_tokens ?? (openaiReq as any).max_completion_tokens ?? "n/a"} stop=${openaiReq.stop?.length ?? 0} tools=${openaiReq.tools ? openaiReq.tools.length : 0} stream=${openaiReq.stream}`,
 		);
 		try {
-			const afterOpenAI = {
-				upstream: "openai",
+			const afterConversionToOpenAICompletions = {
+				provider: "openai",
 				method: "POST",
 				url: "https://api.openai.com/v1/chat/completions",
 				headers: oaiHeaders,
 				body: openaiReq,
 			};
-			console.log(`[${requestId}] AFTER request ${JSON.stringify(afterOpenAI)}`);
-		} catch (e) {
+			console.log(`[${requestId}] AFTER request ${JSON.stringify(afterConversionToOpenAICompletions)}`);
+		} catch (e) {		
 			console.log(`[${requestId}] AFTER request log error (openai)`);
 		}
 		if (openaiReq.stream) {
-			let upstream: Response;
+			let downStreamResponse: Response;
 			try {
-				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=true`);
-				upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+				console.log(`[${requestId}] downStreamResponse->openai POST /v1/chat/completions stream=true`);
+				downStreamResponse = await fetch("https://api.openai.com/v1/chat/completions", {
 					method: "POST",
 					headers: oaiHeaders,
 					body: JSON.stringify(openaiReq),
 				});
 			} catch (e: any) {
-				console.log(`[${requestId}] upstream fetch error provider=openai model=${model}`);
-				return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				console.log(`[${requestId}] downStreamResponse fetch error provider=openai model=${model}`);
+				return oaiErrorEnvelope("downStreamResponse request failed to start", 502, 502);
 			}
-			if (!upstream.ok || !upstream.body) {
-				const text = await upstream.text().catch(() => "");
+			if (!downStreamResponse.ok || !downStreamResponse.body) {
+				const text = await downStreamResponse.text().catch(() => "");
 				console.log(
-					`[${requestId}] upstream non-ok provider=openai status=${upstream.status} model=${model} body_len=${text.length}`,
+					`[${requestId}] downStreamResponse non-ok provider=openai status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
 				);
 				return oaiErrorEnvelope(
-					`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
-					upstream.status,
+					`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
+					downStreamResponse.status,
 					502,
 				);
 			}
@@ -471,33 +475,33 @@ export default {
 					`[${requestId}] streaming start provider=openai model=${model} hdrs=${JSON.stringify(hdrObj)}`,
 				);
 			}
-			return new Response(upstream.body, { status: 200, headers: sseHeaders });
+			return new Response(downStreamResponse.body, { status: 200, headers: sseHeaders });
 		} else {
-			let upstream: Response;
+			let downStreamResponse: Response;
 			try {
-				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=false`);
-				upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+				console.log(`[${requestId}] downStreamResponse->openai POST /v1/chat/completions stream=false`);
+				downStreamResponse = await fetch("https://api.openai.com/v1/chat/completions", {
 					method: "POST",
 					headers: oaiHeaders,
 					body: JSON.stringify(openaiReq),
 				});
 			} catch (e: any) {
-				console.log(`[${requestId}] upstream fetch error provider=openai model=${model}`);
-				return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				console.log(`[${requestId}] downStreamResponse fetch error provider=openai model=${model}`);
+				return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 			}
-			if (!upstream.ok) {
-				const text = await upstream.text().catch(() => "");
+			if (!downStreamResponse.ok) {
+				const text = await downStreamResponse.text().catch(() => "");
 				console.log(
-					`[${requestId}] upstream non-ok provider=openai status=${upstream.status} model=${model} body_len=${text.length}`,
+					`[${requestId}] downStreamResponse non-ok provider=openai status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
 				);
 				return oaiErrorEnvelope(
-					`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
-					upstream.status,
+					`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
+					downStreamResponse.status,
 					502,
 				);
 			}
-			const json = await upstream.text();
-			console.log(`[${requestId}] upstream<-openai json_len=${json.length}`);
+			const json = await downStreamResponse.text();
+			console.log(`[${requestId}] downStreamResponse<-openai json_len=${json.length}`);
 			return new Response(json, { status: 200, headers: { "content-type": "application/json" } });
 		}
 	},
