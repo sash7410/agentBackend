@@ -1,10 +1,19 @@
-import { mapOAItoAnthropic, mapOAItoOpenAI, anthropicSSEtoOAIChunks, ChatCompletionRequest } from "./schema-mapper";
+import {
+	mapOAItoAnthropic,
+	mapOAItoOpenAI,
+	mapOAItoOpenAIResponses,
+	anthropicSSEtoOAIChunks,
+	responsesSSEtoOAIChunks,
+	ChatCompletionRequest,
+	computeDefaultReasoningForClientModel,
+} from "./schema-mapper";
 
 export interface Env {
 	ANTHROPIC_API_KEY: string;
 	OPENAI_API_KEY: string;
 }
 
+//TODO: lolol what is this?
 type WorkerExecutionContext = {
 	waitUntil(promise: Promise<any>): void;
 };
@@ -32,6 +41,7 @@ function oaiErrorEnvelope(message: string, code: string | number | null = null, 
 
 export default {
 	async fetch(req: Request, env: Env, ctx: WorkerExecutionContext): Promise<Response> {
+		console.log(`lolol`);
 		// Assign a short random request id for easy log correlation
 		function headersToObject(h: Headers): Record<string, string> {
 			const obj: Record<string, string> = {};
@@ -117,14 +127,35 @@ export default {
 			return oaiErrorEnvelope("Request must include at least one user message", null, 400);
 		}
 
-		// STEP 4: Decide provider by model prefix
-		const isClaude = model.toLowerCase().startsWith("claude");
+		// STEP 4: Decide provider and defaults from client model registry
+		const clientDefaults = computeDefaultReasoningForClientModel(model);
+		// console.log(
+		// 	`[${requestId}] clientDefaults provider=${clientDefaults.provider} upstreamModel=${clientDefaults.upstreamModel} enableAnthropicThinking=${clientDefaults.enableAnthropicThinking} sendToResponses=${clientDefaults.sendToResponses} model=${model}`,
+		// );
+		const isClaude = clientDefaults.provider === "anthropic" || model.toLowerCase().startsWith("claude");
 
 		if (isClaude) {
+			console.log(
+				`[${requestId}] route=anthropic model=${model} enableThinking=${clientDefaults.enableAnthropicThinking}`,
+			);
 			// Anthropic route:
 			// - We only support streaming for Anthropic in this minimal proxy
 			if (!stream) {
 				return oaiErrorEnvelope("Anthropic non-streaming is not supported in v1. Please set stream=true.", null, 400);
+			}
+
+			// Inject Anthropic thinking when the client mapping marks this model as redacted_thinking
+			if (clientDefaults.enableAnthropicThinking && !(body as any)?.thinking) {
+				// Ensure Anthropic extended thinking includes a required budget
+				const DEFAULT_THINKING_BUDGET = 1024;
+				body = {
+					...(body as any),
+					thinking: {
+						type: "enabled",
+						budget_tokens: DEFAULT_THINKING_BUDGET,
+					},
+				} as any;
+				console.log(`[${requestId}] route=anthropic injectThinking=true`);
 			}
 
 			// STEP A: Map incoming OpenAI-style request to Anthropic Messages API
@@ -134,9 +165,9 @@ export default {
 			} catch (err: any) {
 				return oaiErrorEnvelope(err?.message ?? "Invalid request", null, 400);
 			}
-			console.log(
-				`[${requestId}] mapped->anthropic system=${mapped.request.system ? true : false} msgs=${mapped.request.messages.length} max_tokens=${mapped.request.max_tokens} stop=${mapped.request.stop_sequences?.length ?? 0} temp=${mapped.request.temperature ?? "n/a"} warnTools=${mapped.warnIgnoredTools}`,
-			);
+			// console.log(
+			// 	`[${requestId}] mapped->anthropic system=${mapped.request.system ? true : false} msgs=${mapped.request.messages.length} max_tokens=${mapped.request.max_tokens} stop=${mapped.request.stop_sequences?.length ?? 0} temp=${mapped.request.temperature ?? "n/a"} warnTools=${mapped.warnIgnoredTools}`,
+			// );
 
 			// STEP B: Call Anthropic with streaming enabled
 			const headers: Record<string, string> = {
@@ -161,8 +192,8 @@ export default {
 
 			let upstream: Response;
 			try {
-                console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
-				console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
+                // console.log(`[${requestId}] mapped.request=${JSON.stringify(mapped.request)}`);
+				// console.log(`[${requestId}] upstream->anthropic POST /v1/messages stream=true`);
 				upstream = await fetch("https://api.anthropic.com/v1/messages", {
 					method: "POST",
 					headers,
@@ -185,6 +216,11 @@ export default {
 					502,
 				);
 			}
+			// const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
+			// ? "claude-sonnet-4-5"
+			// : req.model;
+			// console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
+			
 
 			// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
 			const translated = anthropicSSEtoOAIChunks(model, upstream.body, `[${requestId}] provider=anthropic model=${model}`);
@@ -221,8 +257,114 @@ export default {
 			return response;
 		}
 
-		// OpenAI pass-through route:
-		// - We keep OpenAI schema, only normalizing a few fields (e.g., gpt-5 uses max_completion_tokens)
+		// OpenAI routing:
+		// - Client models with redacted_thinking -> OpenAI Responses API
+		// - Others -> OpenAI Chat Completions (existing behavior)
+		const isReasoningModel = clientDefaults.sendToResponses;
+		const oaiHeaders: Record<string, string> = {
+			"content-type": "application/json",
+			authorization: `Bearer ${env.OPENAI_API_KEY}`,
+		};
+
+		if (isReasoningModel) {
+			// Responses API path for reasoning models
+			let responsesReq;
+			try {
+				// Apply default mapping: upstream model and default reasoning effort if not supplied
+				const baseAdjusted: any = { ...body, model: clientDefaults.upstreamModel };
+				const incomingEffort =
+					(typeof (body as any)?.reasoning_effort === "string" && (body as any).reasoning_effort) ||
+					((body as any)?.reasoning && (body as any).reasoning.effort);
+				if (!incomingEffort && clientDefaults.defaultEffort) {
+					baseAdjusted.reasoning = { effort: clientDefaults.defaultEffort };
+				}
+				responsesReq = mapOAItoOpenAIResponses(baseAdjusted as any);
+			} catch (err: any) {
+				return oaiErrorEnvelope(err?.message ?? "Invalid request", null, 400);
+			}
+			try {
+				const afterOpenAI = {
+					upstream: "openai",
+					method: "POST",
+					url: "https://api.openai.com/v1/responses",
+					headers: oaiHeaders,
+					body: responsesReq,
+				};
+				console.log(`[${requestId}] AFTER request for reasoning model ${JSON.stringify(afterOpenAI)}`);
+			} catch (e) {
+				console.log(`[${requestId}] AFTER request log error (openai-responses)`);
+			}
+
+			if (responsesReq.stream) {
+				let upstream: Response;
+				try {
+					console.log(`[${requestId}] upstream->openai POST /v1/responses stream=true`);
+					upstream = await fetch("https://api.openai.com/v1/responses", {
+						method: "POST",
+						headers: oaiHeaders,
+						body: JSON.stringify(responsesReq),
+					});
+				} catch (e: any) {
+					console.log(`[${requestId}] upstream fetch error provider=openai-responses model=${model}`);
+					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				}
+				if (!upstream.ok || !upstream.body) {
+					const text = await upstream.text().catch(() => "");
+					console.log(
+						`[${requestId}] upstream non-ok provider=openai-responses status=${upstream.status} model=${model} body_len=${text.length}`,
+					);
+					return oaiErrorEnvelope(
+						`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
+						upstream.status,
+						502,
+					);
+				}
+				const sseHeaders = new Headers();
+				sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
+				sseHeaders.set("cache-control", "no-cache, no-transform");
+				sseHeaders.set("connection", "keep-alive");
+				console.log(
+					`[${requestId}] streaming start provider=openai-responses model=${model}`,
+				);
+				// Translate Responses SSE to OpenAI Chat Completions-style chunks for client compatibility
+				const translated = responsesSSEtoOAIChunks(
+					// Preserve the client-requested model id in SSE for client compatibility
+					model,
+					upstream.body,
+					`[${requestId}] provider=openai-responses model=${responsesReq.model}`,
+				);
+				return new Response(translated, { status: 200, headers: sseHeaders });
+			} else {
+				let upstream: Response;
+				try {
+					console.log(`[${requestId}] upstream->openai POST /v1/responses stream=false`);
+					upstream = await fetch("https://api.openai.com/v1/responses", {
+						method: "POST",
+						headers: oaiHeaders,
+						body: JSON.stringify(responsesReq),
+					});
+				} catch (e: any) {
+					console.log(`[${requestId}] upstream fetch error provider=openai-responses model=${model}`);
+					return oaiErrorEnvelope("Upstream request failed to start", 502, 502);
+				}
+				if (!upstream.ok) {
+					const text = await upstream.text().catch(() => "");
+					console.log(
+						`[${requestId}] upstream non-ok provider=openai-responses status=${upstream.status} model=${model} body_len=${text.length}`,
+					);
+					return oaiErrorEnvelope(
+						`Upstream error (${upstream.status}). ${text || "OpenAI did not provide additional details."}`,
+						upstream.status,
+						502,
+					);
+				}
+				const json = await upstream.text();
+				console.log(`[${requestId}] upstream<-openai-responses json_len=${json.length}`);
+				return new Response(json, { status: 200, headers: { "content-type": "application/json" } });
+			}
+		}
+
+		// Existing OpenAI Chat Completions path for non-reasoning models
 		let openaiReq;
 		try {
 			openaiReq = mapOAItoOpenAI(body);
@@ -232,13 +374,6 @@ export default {
 		console.log(
 			`[${requestId}] mapped->openai msgs=${openaiReq.messages.length} max=${openaiReq.max_tokens ?? (openaiReq as any).max_completion_tokens ?? "n/a"} stop=${openaiReq.stop?.length ?? 0} tools=${openaiReq.tools ? openaiReq.tools.length : 0} stream=${openaiReq.stream}`,
 		);
-
-		// STEP F: Call OpenAI with either streaming or non-stream JSON
-		const oaiHeaders: Record<string, string> = {
-			"content-type": "application/json",
-			authorization: `Bearer ${env.OPENAI_API_KEY}`,
-		};
-		// AFTER: Log full outbound request to OpenAI (method, URL, headers, mapped body)
 		try {
 			const afterOpenAI = {
 				upstream: "openai",
@@ -251,9 +386,7 @@ export default {
 		} catch (e) {
 			console.log(`[${requestId}] AFTER request log error (openai)`);
 		}
-
 		if (openaiReq.stream) {
-			// Streaming passthrough
 			let upstream: Response;
 			try {
 				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=true`);
@@ -292,7 +425,6 @@ export default {
 			}
 			return new Response(upstream.body, { status: 200, headers: sseHeaders });
 		} else {
-			// Non-streaming JSON
 			let upstream: Response;
 			try {
 				console.log(`[${requestId}] upstream->openai POST /v1/chat/completions stream=false`);
@@ -317,7 +449,6 @@ export default {
 					502,
 				);
 			}
-			// We return the JSON exactly as received so client sees OpenAI-standard response
 			const json = await upstream.text();
 			console.log(`[${requestId}] upstream<-openai json_len=${json.length}`);
 			return new Response(json, { status: 200, headers: { "content-type": "application/json" } });

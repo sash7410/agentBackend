@@ -1,3 +1,4 @@
+import { getModelsArray } from "./client_mapping";
 // Minimal schema mapper and streaming translator for Firebender edge contract
 // Functions:
 // - mapOAItoAnthropic: maps Firebender ChatCompletionRequest to Anthropic Messages (+warning flag)
@@ -23,12 +24,16 @@ export type ChatCompletionRequest = {
 	max_completion_tokens?: number | null;
 	// Placeholder for OpenAI reasoning models; not used by this minimal proxy
 	reasoning_effort?: string | null;
+	// Optional OpenAI reasoning container used by newer APIs
+	reasoning?: { effort?: "low" | "medium" | "high" } | null;
 	// A single "system" string; if present, we ensure one system message is applied
 	system?: string | null;
 	// Tools are ignored for Anthropic in this v1; we forward them to OpenAI as-is
 	tools?: any[] | null;
 	// Arbitrary variables clients can pass; we only log the key count
 	user_variables?: Record<string, any> | null;
+	// Optional Anthropic extended thinking controls (pass-through only)
+	thinking?: { type?: "enabled"; budget_tokens?: number } | null;
 };
 
 export type AnthropicMessage = {
@@ -62,6 +67,8 @@ export type AnthropicRequest = {
 	stop_sequences?: string[];
 	stream: boolean;
 	tools?: AnthropicToolDef[];
+	// Extended thinking (if provided by caller)
+	thinking?: { type: "enabled"; budget_tokens?: number };
 };
 
 export type OpenAIChatRequest = {
@@ -73,7 +80,62 @@ export type OpenAIChatRequest = {
 	stop?: string[];
 	tools?: any[];
 	stream?: boolean;
+	// Reasoning settings supported by GPT-5 family
+	reasoning?: { effort?: "low" | "medium" | "high" };
 };
+
+// OpenAI Responses API (for GPT-5/reasoning)
+export type OpenAIResponsesRequest = {
+	model: string;
+	messages?: { role: "system" | "user" | "assistant" | "tool"; content: string; name?: string }[];
+	// Some clients may send unified "input" instead of messages; we keep messages for compatibility
+	input?: any;
+	reasoning?: { effort?: "low" | "medium" | "high" };
+	max_output_tokens?: number;
+	temperature?: number;
+	stream?: boolean;
+	tools?: any[];
+};
+
+export function computeDefaultReasoningForClientModel(clientModelId: string): {
+	provider: "openai" | "anthropic" | null;
+	upstreamModel: string;
+	sendToResponses: boolean;
+	defaultEffort?: "low" | "high";
+	enableAnthropicThinking: boolean;
+} {
+	const models = getModelsArray();
+	const lcId = (clientModelId || "").toLowerCase();
+	const record =
+		models.find((m: any) => (m?.id || "").toLowerCase() === lcId) ||
+		models.find((m: any) => (m?.model || "").toLowerCase() === lcId) ||
+		null;
+	const providerRaw = (record?.provider ?? null) as any;
+	const provider: "openai" | "anthropic" | null =
+		providerRaw === "anthropic" ? "anthropic" : "openai";
+	const redactedThinking = Boolean(record?.redacted_thinking);
+	let upstreamModel = (record?.model as string) || clientModelId;
+	const resolvedId = ((record?.id as string) || clientModelId).toLowerCase();
+	let defaultEffort: "low" | "high" | undefined;
+	// Determine if this is an explicit low/high variant (the only ones we route to Responses)
+	const isLow = /(^|-)low($|-)/.test(resolvedId);
+	const isHigh = /(^|-)high($|-)/.test(resolvedId);
+	const isLowOrHigh = isLow || isHigh;
+	if (redactedThinking && provider === "openai") {
+		// Normalize effort only for explicit low/high variants
+		if (isLow) defaultEffort = "low";
+		if (isHigh) defaultEffort = "high";
+		// Normalize upstream naming for low/high families to base 'gpt-5'
+		if ((upstreamModel || "").toLowerCase().startsWith("gpt-5-") && (defaultEffort === "low" || defaultEffort === "high")) {
+			upstreamModel = "gpt-5";
+		}
+	}
+	const enableAnthropicThinking = provider === "anthropic" && redactedThinking;
+	// Only send to Responses for OpenAI models that are explicitly low/high variants and marked redacted_thinking
+	const sendToResponses = provider === "openai" && redactedThinking && isLowOrHigh;
+	console.log(`[computeDefaultReasoningForClientModel] clientModelId=${clientModelId} provider=${provider} upstreamModel=${upstreamModel} defaultEffort=${defaultEffort} enableAnthropicThinking=${enableAnthropicThinking} sendToResponses=${sendToResponses} isLowOrHigh=${isLowOrHigh}`);
+	return { provider, upstreamModel, sendToResponses, defaultEffort, enableAnthropicThinking };
+}
 
 const MAX_TOKENS_CAP = 8192;
 const DEFAULT_MAX_TOKENS = 1024;
@@ -291,19 +353,23 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 			: Boolean(req.stream);
 
 	// Debug logs for mapping details (visible in worker logs)
-	try {
-		console.log(
-			`[mapper->anthropic] system_present=${Boolean(conv.system)} msgs_in=${req.messages?.length ?? 0} msgs_out=${conv.messages.length} had_tools=${conv.hadAnyToolsSignal} temp=${temperature ?? "n/a"} max_tokens=${maxTokens} stop_seq=${stop_sequences?.length ?? 0} stream=${stream}`,
-		);
-	} catch {
-		// ignore logging errors
-	}
+	// try {
+	// 	console.log(
+	// 		`[mapper->anthropic] system_present=${Boolean(conv.system)} msgs_in=${req.messages?.length ?? 0} msgs_out=${conv.messages.length} had_tools=${conv.hadAnyToolsSignal} temp=${temperature ?? "n/a"} max_tokens=${maxTokens} stop_seq=${stop_sequences?.length ?? 0} stream=${stream}`,
+	// 	);
+	// } catch {
+	// 	// ignore logging errors
+	// }
 
 	// We return Anthropic's native request shape, but we also return a flag if tools were present
 	// so the caller can attach a warning header for the client.
+	const mappedModel = (req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929"
+		? "claude-sonnet-4-5"
+		: req.model;
+		console.log(`[mapper->anthropic] mappedModel=${mappedModel}`);
 	return {
 		request: {
-			model: req.model,
+			model: mappedModel,
 			system: conv.system,
 			messages: conv.messages,
 			max_tokens: maxTokens,
@@ -311,6 +377,11 @@ export function mapOAItoAnthropic(req: ChatCompletionRequest): { request: Anthro
 			stop_sequences,
 			stream,
 			tools: conv.anthropicTools,
+			// Enable Anthropic extended thinking only for specific model(s)
+			thinking:
+				((req.model || "").toLowerCase() === "claude-sonnet-4-5-20250929" && (req as any)?.thinking)
+					? { type: "enabled", ...(req as any).thinking }
+					: undefined,
 		},
 		// Tools supported in this mapping
 		warnIgnoredTools: false,
@@ -369,15 +440,94 @@ export function mapOAItoOpenAI(req: ChatCompletionRequest): OpenAIChatRequest {
 	if (tools) openaiReq.tools = tools;
 
 	// Debug logs for mapping details (visible in worker logs)
-	try {
-		const maxField = (openaiReq as any).max_completion_tokens ?? openaiReq.max_tokens ?? "n/a";
-		console.log(
-			`[mapper->openai] model=${req.model} msgs_in=${req.messages?.length ?? 0} msgs_out=${openaiReq.messages.length} system_included=${Boolean(req.system)} temp=${temperature ?? "n/a"} max=${maxField} stop=${stop?.length ?? 0} tools=${tools?.length ?? 0} stream=${stream}`,
-		);
-	} catch {
-		// ignore logging errors
-	}
+	// try {
+	// 	const maxField = (openaiReq as any).max_completion_tokens ?? openaiReq.max_tokens ?? "n/a";
+	// 	console.log(
+	// 		`[mapper->openai] model=${req.model} msgs_in=${req.messages?.length ?? 0} msgs_out=${openaiReq.messages.length} system_included=${Boolean(req.system)} temp=${temperature ?? "n/a"} max=${maxField} stop=${stop?.length ?? 0} tools=${tools?.length ?? 0} stream=${stream}`,
+	// 	);
+	// } catch {
+	// 	// ignore logging errors
+	// }
 	return openaiReq;
+}
+
+export function mapOAItoOpenAIResponses(req: ChatCompletionRequest): OpenAIResponsesRequest {
+	if (!req || typeof req !== "object") {
+		throw new Error("Invalid request body");
+	}
+	if (!Array.isArray(req.messages) || typeof req.model !== "string") {
+		throw new Error("Missing required fields: model, messages");
+	}
+
+	const modelNormalized = (req.model || "").toLowerCase();
+	// For gpt-5-low, upstream requires "gpt-5". We normalize and enforce reasoning low.
+
+	// Normalize to Responses-compatible minimal shape: only role + content.
+	// Strip unsupported fields like tool_calls/tool_call_id, and convert tool role to user.
+	let messages = req.messages.slice(0).map((m) => {
+		const norm = normalizeContentToText((m as any).content);
+		const role = (m.role === "tool" ? "user" : m.role) as "system" | "user" | "assistant";
+		return { role, content: norm.text };
+	});
+	if (req.system) {
+		const hasSystemMsg = messages.some((m) => m.role === "system");
+		if (!hasSystemMsg) {
+			messages = [{ role: "system", content: String(req.system) }, ...messages];
+		}
+	}
+	if (!messages.some((m) => m.role === "user")) {
+		throw new Error("At least one user message is required");
+	}
+
+	const temperature = req.temperature !== null && req.temperature !== undefined ? clamp(req.temperature, 0, 2) : undefined;
+	// Responses API uses max_output_tokens
+	let chosenMax: number | undefined;
+	if (req.max_tokens !== null && req.max_tokens !== undefined) {
+		chosenMax = clamp(Number(req.max_tokens), 1, MAX_TOKENS_CAP);
+	} else if (req.max_completion_tokens !== null && req.max_completion_tokens !== undefined) {
+		chosenMax = clamp(Number(req.max_completion_tokens), 1, MAX_TOKENS_CAP);
+	}
+	const stream = req.stream === null || req.stream === undefined ? true : Boolean(req.stream);
+	let effort: "low" | "medium" | "high" | undefined =
+		((typeof req.reasoning_effort === "string" ? req.reasoning_effort : undefined) as any) ||
+		((req as any).reasoning && (req as any).reasoning.effort) ||
+		undefined;
+
+	const out: OpenAIResponsesRequest = {
+		model: modelNormalized,
+		// Responses API expects conversation under "input", not "messages"
+		input: messages as any,
+		temperature,
+		stream,
+	};
+	if (chosenMax !== undefined) out.max_output_tokens = chosenMax;
+	if (effort) out.reasoning = { effort };
+	if (Array.isArray(req.tools) && req.tools.length > 0) {
+		// Normalize tools so Responses API receives a top-level "name" when using function tools
+		out.tools = req.tools.map((t: any) => {
+			try {
+				if (t && (t.type === "function" || t.function)) {
+					const name = t.name ?? t.function?.name;
+					if (name && !t.name) {
+						return { ...t, name };
+					}
+				}
+			} catch {
+				// fall through
+			}
+			return t;
+		});
+	}
+
+	// Debug
+	// try {
+	// 	console.log(
+	// 		`[mapper->openai-responses] model=${req.model} msgs_in=${req.messages?.length ?? 0} input_len=${Array.isArray(out.input) ? out.input.length : (out.input ? 1 : 0)} temp=${temperature ?? "n/a"} max_output_tokens=${out.max_output_tokens ?? "n/a"} effort=${effort ?? "n/a"} stream=${stream}`,
+	// 	);
+	// } catch {
+	// 	// ignore
+	// }
+	return out;
 }
 
 function generateOpenAIChunkId(): string {
@@ -576,6 +726,154 @@ export function anthropicSSEtoOAIChunks(
 					processText(chunkText);
 				} catch {
 					// ignore malformed chunks
+				}
+				return reader.read().then(handle);
+			}).catch(() => {
+				try {
+					emitDone();
+					controller.close();
+				} catch {
+					// ignore
+				}
+			});
+		},
+		cancel() {
+			// no-op
+		},
+	});
+}
+
+export function responsesSSEtoOAIChunks(
+	model: string,
+	upstream: ReadableStream<Uint8Array>,
+	debugPrefix?: string,
+): ReadableStream<Uint8Array> {
+	// Convert OpenAI Responses API SSE frames to OpenAI Chat Completions chunk frames
+	// Heuristic: emit text for events carrying `delta` strings and finish on response.completed/incomplete
+	const id = generateOpenAIChunkId();
+	const created = Math.floor(Date.now() / 1000);
+	const encoder = new TextEncoder();
+	const decoder = new TextDecoder();
+
+	let buffered = "";
+	let sentRole = false;
+	let finished = false;
+	let eventCount = 0;
+
+	function encodeDataLine(objOrString: any): Uint8Array {
+		if (typeof objOrString === "string") {
+			return encoder.encode(`data: ${objOrString}\n\n`);
+		}
+		return encoder.encode(`data: ${JSON.stringify(objOrString)}\n\n`);
+	}
+
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			const reader = upstream.getReader();
+
+			function pushAssistantRoleIfNeeded() {
+				if (!sentRole) {
+					if (debugPrefix) {
+						console.log(`${debugPrefix} resp-translator: emit role=assistant`);
+					}
+					const first = openAIChunkEnvelope({
+						id,
+						created,
+						model,
+						delta: { role: "assistant" },
+						finish_reason: null,
+					});
+					controller.enqueue(encodeDataLine(first));
+					sentRole = true;
+				}
+			}
+
+			function emitFinish(reason: "stop" | "length") {
+				if (finished) return;
+				const finalChunk = openAIChunkEnvelope({
+					id,
+					created,
+					model,
+					delta: {},
+					finish_reason: reason,
+				});
+				controller.enqueue(encodeDataLine(finalChunk));
+			}
+
+			function emitDone() {
+				if (!finished) {
+					if (debugPrefix) {
+						console.log(`${debugPrefix} resp-translator: emit [DONE]`);
+					}
+					controller.enqueue(encodeDataLine("[DONE]"));
+					finished = true;
+				}
+			}
+
+			function processText(text: string) {
+				buffered += text;
+				const segments = buffered.split("\n\n");
+				buffered = segments.pop() ?? "";
+				for (const seg of segments) {
+					const events = parseSSELines(seg + "\n\n");
+					for (const e of events) {
+						eventCount++;
+						const ev = e.event || "";
+						const data = e.data || {};
+						if (debugPrefix) {
+							// Log only event names to avoid leaking content
+							console.log(`${debugPrefix} resp-translator: event#${eventCount} ${ev}`);
+						}
+						// Stream text deltas
+						if (ev.includes("output_text.delta") || typeof data?.delta === "string") {
+							const textDelta: string = typeof data?.delta === "string" ? data.delta : "";
+							if (textDelta) {
+								pushAssistantRoleIfNeeded();
+								const chunk = openAIChunkEnvelope({
+									id,
+									created,
+									model,
+									delta: { content: textDelta },
+									finish_reason: null,
+								});
+								controller.enqueue(encodeDataLine(chunk));
+							}
+							continue;
+						}
+						// Completion events
+						if (ev.includes("response.completed")) {
+							pushAssistantRoleIfNeeded();
+							emitFinish("stop");
+							continue;
+						}
+						if (ev.includes("response.incomplete")) {
+							pushAssistantRoleIfNeeded();
+							const reason = (data?.reason || "").toString();
+							emitFinish(reason === "max_output_tokens" ? "length" : "stop");
+							continue;
+						}
+					}
+				}
+			}
+
+			reader.read().then(function handle(result): any {
+				if (result.done) {
+					try {
+						emitDone();
+						controller.close();
+					} catch {
+						// ignore
+					}
+					return;
+				}
+				try {
+					const chunkText = decoder.decode(result.value, { stream: true });
+					if (debugPrefix) {
+						console.log(`${debugPrefix} resp-translator: received upstream bytes=${result.value?.length ?? 0}`);
+					}
+					processText(chunkText);
+				} catch {
+					// ignore
 				}
 				return reader.read().then(handle);
 			}).catch(() => {
