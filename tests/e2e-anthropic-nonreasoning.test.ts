@@ -22,4 +22,20 @@ test("E2E: Anthropic non-reasoning streams via messages translated to OpenAI chu
 	expect.toBe(lines[lines.length - 1], "[DONE]");
 });
 
+test("E2E JSON: Anthropic non-reasoning returns chat.completion JSON", async () => {
+	const body = {
+		model: "claude-sonnet-4-20250514",
+		stream: false,
+		max_tokens: 256,
+		messages: [{ role: "system", content: "You are concise" }, { role: "user", content: "Say hello" }],
+	};
+	const resp = await postJson("http://localhost:8787/v1/chat/completions", body);
+	expect.toBe(resp.ok, true);
+	expect.toBe(resp.headers.get("content-type"), "application/json");
+	const json = await resp.json();
+	expect.toBe(json.object, "chat.completion");
+	expect.toBeTruthy(Array.isArray(json.choices));
+	expect.toBe(json.choices[0].message.role, "assistant");
+});
+
 

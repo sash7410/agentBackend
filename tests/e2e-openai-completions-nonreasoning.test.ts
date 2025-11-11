@@ -22,4 +22,20 @@ test("E2E: OpenAI gpt-5 (non-reasoning) streams via chat/completions", async () 
 	expect.toBe(first.object, "chat.completion.chunk");
 });
 
+test("E2E JSON: OpenAI gpt-5 (non-reasoning) returns chat.completion JSON", async () => {
+	const body = {
+		model: "gpt-5",
+		stream: false,
+		max_tokens: 128,
+		messages: [{ role: "user", content: "Say hello in one word" }],
+	};
+	const resp = await postJson("http://localhost:8787/v1/chat/completions", body);
+	expect.toBe(resp.ok, true);
+	expect.toBe(resp.headers.get("content-type"), "application/json");
+	const json = await resp.json();
+	expect.toBe(json.object, "chat.completion");
+	expect.toBeTruthy(Array.isArray(json.choices));
+	expect.toBe(json.choices[0].message.role, "assistant");
+});
+
 
