@@ -104,7 +104,15 @@ export function mapOAItoOpenAIResponses(req: ChatCompletionRequest): OpenAIRespo
 		stream,
 	};
 	if (chosenMax !== undefined) out.max_output_tokens = chosenMax;
-	if (effort) out.reasoning = { effort };
+	const requestedSummary: "auto" | "extended" | undefined =
+		((req as any).reasoning && (req as any).reasoning.summary) || undefined;
+	if (effort || requestedSummary) {
+		out.reasoning = {
+			...(effort ? { effort } : {}),
+			// Default to 'auto' when effort is used but summary not explicitly provided
+			...(requestedSummary ? { summary: requestedSummary } : effort ? { summary: "auto" } : {}),
+		};
+	}
 	if (Array.isArray(req.tools) && req.tools.length > 0) {
 		out.tools = req.tools.map((t: any) => {
 			try {

@@ -90,6 +90,8 @@ export function anthropicSSEtoOAIChunks(
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
 			const reader = downStreamResponse.getReader();
+			const blockTypeByIndex: Record<number, string> = {};
+			const signatureByIndex: Record<number, string> = {};
 
 			function redactAnthropicData(input: any): any {
 				try {
@@ -177,6 +179,21 @@ export function anthropicSSEtoOAIChunks(
 								console.log(`${debugPrefix} translator: event#${eventCount} message_start`);
 							}
 							pushAssistantRoleIfNeeded();
+						} else if (e.event === "content_block_start") {
+							const cbType = (e as any)?.data?.content_block?.type || "";
+							const idx = (e as any)?.data?.index;
+							if (typeof idx === "number") {
+								blockTypeByIndex[idx] = cbType;
+								signatureByIndex[idx] = "";
+							}
+							if (debugPrefix) {
+								console.log(
+									`${debugPrefix} translator: event#${eventCount} content_block_start type=${cbType} index=${idx}`,
+								);
+								if (cbType === "thinking" || cbType === "redacted_thinking") {
+                                    console.log(`${debugPrefix} translator: thinking.start index=${idx}`);
+                                }
+							}
 						} else if (e.event === "content_block_delta") {
 							pushAssistantRoleIfNeeded();
 							if (debugPrefix) {
@@ -187,6 +204,55 @@ export function anthropicSSEtoOAIChunks(
 									}
 								} catch {}
 							}
+							// Anthropic thinking deltas (extended thinking)
+							try {
+								const idx = (e as any)?.data?.index;
+								const deltaType = (e as any)?.data?.delta?.type;
+								if (deltaType === "thinking_delta") {
+									const thinkingDelta: string = (e as any)?.data?.delta?.thinking ?? "";
+									if (thinkingDelta && debugPrefix) {
+										const preview = thinkingDelta.length > 160 ? `${thinkingDelta.slice(0, 160)}…` : thinkingDelta;
+										console.log(
+											`${debugPrefix} translator: thinking.delta len=${thinkingDelta.length} preview="${preview}"`,
+										);
+									}
+									if (thinkingDelta) {
+										const thinkingFrame = {
+											type: "thinking",
+											thinking: thinkingDelta,
+											signature: "",
+										};
+										controller.enqueue(
+											encodeDataLine({ type: "oai.thinking.delta", data: thinkingFrame }),
+										);
+									}
+								} else if (deltaType === "signature_delta") {
+									const sig: string = (e as any)?.data?.delta?.signature ?? "";
+									if (sig && debugPrefix) {
+										console.log(`${debugPrefix} translator: thinking.signature.delta len=${sig.length}`);
+									}
+									if (sig && typeof idx === "number") {
+										signatureByIndex[idx] = (signatureByIndex[idx] || "") + sig;
+									}
+								} else if (deltaType === "redacted_thinking_delta") {
+									const redactedData: string = (e as any)?.data?.delta?.data ?? "";
+									if (redactedData && debugPrefix) {
+										const preview = redactedData.length > 40 ? `${redactedData.slice(0, 40)}…` : redactedData;
+										console.log(
+											`${debugPrefix} translator: redacted_thinking.delta len=${redactedData.length} preview="${preview}"`,
+										);
+									}
+									if (redactedData) {
+										const redactedFrame = {
+											type: "redacted_thinking",
+											data: redactedData,
+										};
+										controller.enqueue(
+											encodeDataLine({ type: "oai.thinking.delta", data: redactedFrame }),
+										);
+									}
+								}
+							} catch {}
 							const textDelta = e.data?.delta?.text ?? "";
 							if (debugPrefix) {
 								console.log(`${debugPrefix} translator: event#${eventCount} text_delta len=${(textDelta || "").length}`);
@@ -200,6 +266,34 @@ export function anthropicSSEtoOAIChunks(
 									finish_reason: null,
 								});
 								controller.enqueue(encodeDataLine(chunk));
+							}
+						} else if (e.event === "content_block_stop") {
+							const idx = (e as any)?.data?.index;
+							if (debugPrefix) {
+								console.log(`${debugPrefix} translator: event#${eventCount} content_block_stop index=${idx}`);
+							}
+							if (typeof idx === "number") {
+								const cbType = blockTypeByIndex[idx] || "";
+								if (cbType === "thinking") {
+									const thinkingDone = {
+										type: "thinking",
+										thinking: "",
+										signature: signatureByIndex[idx] || "",
+									};
+									controller.enqueue(
+										encodeDataLine({ type: "oai.thinking.done", data: thinkingDone }),
+									);
+								} else if (cbType === "redacted_thinking") {
+									const redactedDone = {
+										type: "redacted_thinking",
+										data: "",
+									};
+									controller.enqueue(
+										encodeDataLine({ type: "oai.thinking.done", data: redactedDone }),
+									);
+								}
+								delete blockTypeByIndex[idx];
+								delete signatureByIndex[idx];
 							}
 						} else if (e.event === "message_delta") {
 							const stopReason: string | undefined = e.data?.delta?.stop_reason ?? e.data?.stop_reason;
@@ -341,18 +435,102 @@ export function responsesSSEtoOAIChunks(
 						if (debugPrefix) {
 							console.log(`${debugPrefix} resp-translator: event#${eventCount} ${ev}`);
 						}
+						// Log and emit reasoning summary part lifecycle for easier client consumption
+						if (ev.includes("reasoning_summary_part.added")) {
+							const itemId: string = typeof data?.item_id === "string" ? data.item_id : "";
+							const summaryIndex = typeof data?.summary_index === "number" ? data.summary_index : null;
+							if (debugPrefix) {
+								console.log(
+									`${debugPrefix} resp-translator: thinking.part.added item_id=${itemId} summary_index=${summaryIndex}`,
+								);
+							}
+							const signature = JSON.stringify({ item_id: itemId, summary_index: summaryIndex });
+							const thinkingPartAdded = {
+								type: "thinking",
+								thinking: "",
+								signature,
+							};
+							controller.enqueue(
+								encodeDataLine({ type: "oai.thinking.part.added", data: thinkingPartAdded }),
+							);
+							continue;
+						}
+						if (ev.includes("reasoning_summary_part.done")) {
+							const itemId: string = typeof data?.item_id === "string" ? data.item_id : "";
+							const summaryIndex = typeof data?.summary_index === "number" ? data.summary_index : null;
+							if (debugPrefix) {
+								console.log(
+									`${debugPrefix} resp-translator: thinking.part.done item_id=${itemId} summary_index=${summaryIndex}`,
+								);
+							}
+							const signature = JSON.stringify({ item_id: itemId, summary_index: summaryIndex });
+							const thinkingPartDone = {
+								type: "thinking",
+								thinking: "",
+								signature,
+							};
+							controller.enqueue(
+								encodeDataLine({ type: "oai.thinking.part.done", data: thinkingPartDone }),
+							);
+							continue;
+						}
+						// Stream OpenAI Responses reasoning summary (thinking) as custom frames
+						if (ev.includes("reasoning_summary_text.delta")) {
+							const textDelta: string =
+								typeof data?.delta === "string" ? data.delta : (typeof data?.text === "string" ? data.text : "");
+							if (textDelta) {
+								if (debugPrefix) {
+									const preview = textDelta.length > 160 ? `${textDelta.slice(0, 160)}…` : textDelta;
+									console.log(
+										`${debugPrefix} resp-translator: thinking.delta len=${textDelta.length} preview="${preview}"`,
+									);
+								}
+								// Ensure role is established for consumers that expect the first chunk to set role
+								pushAssistantRoleIfNeeded();
+								const thinkingFrame = {
+									type: "thinking",
+									thinking: textDelta,
+									signature: "",
+								};
+								controller.enqueue(
+									encodeDataLine({ type: "oai.thinking.delta", data: thinkingFrame }),
+								);
+							}
+								continue;
+							}
+						if (ev.includes("reasoning_summary_text.done")) {
+							const textFinal: string = typeof data?.text === "string" ? data.text : "";
+							if (textFinal) {
+								if (debugPrefix) {
+									const preview = textFinal.length > 240 ? `${textFinal.slice(0, 240)}…` : textFinal;
+									console.log(
+										`${debugPrefix} resp-translator: thinking.done len=${textFinal.length} preview="${preview}"`,
+									);
+								}
+								pushAssistantRoleIfNeeded();
+								const thinkingFrame = {
+									type: "thinking",
+									thinking: textFinal,
+									signature: "",
+								};
+								controller.enqueue(
+									encodeDataLine({ type: "oai.thinking.done", data: thinkingFrame }),
+								);
+							}
+							continue;
+						}
 						if (ev.includes("output_text.delta") || typeof data?.delta === "string") {
 							const textDelta: string = typeof data?.delta === "string" ? data.delta : "";
 							if (textDelta) {
-								pushAssistantRoleIfNeeded();
-								const chunk = openAIChunkEnvelope({
-									id,
-									created,
-									model,
-									delta: { content: textDelta },
-									finish_reason: null,
-								});
-								controller.enqueue(encodeDataLine(chunk));
+									pushAssistantRoleIfNeeded();
+									const chunk = openAIChunkEnvelope({
+										id,
+										created,
+										model,
+										delta: { content: textDelta },
+										finish_reason: null,
+									});
+									controller.enqueue(encodeDataLine(chunk));
 							}
 							continue;
 						}

@@ -31,4 +31,22 @@ export async function collectSSE(stream: ReadableStream<Uint8Array>): Promise<st
 	return out;
 }
 
+export async function collectSSEObjects(stream: ReadableStream<Uint8Array>): Promise<any[]> {
+	const lines = await collectSSE(stream);
+	const objs: any[] = [];
+	for (const l of lines) {
+		if (l === "[DONE]") {
+			objs.push(l);
+			continue;
+		}
+		try {
+			const obj = JSON.parse(l);
+			objs.push(obj);
+		} catch {
+			// ignore non-JSON data frames
+		}
+	}
+	return objs;
+}
+
 

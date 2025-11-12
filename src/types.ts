@@ -12,7 +12,7 @@ export type ChatCompletionRequest = {
 	stream_options?: any | null;
 	max_completion_tokens?: number | null;
 	reasoning_effort?: string | null;
-	reasoning?: { effort?: "low" | "medium" | "high" } | null;
+		reasoning?: { effort?: "low" | "medium" | "high"; summary?: "auto" | "extended" } | null;
 	system?: string | null;
 	tools?: any[] | null;
 	user_variables?: Record<string, any> | null;
@@ -68,7 +68,7 @@ export type OpenAIResponsesRequest = {
 	model: string;
 	messages?: { role: "system" | "user" | "assistant" | "tool"; content: string; name?: string }[];
 	input?: any;
-	reasoning?: { effort?: "low" | "medium" | "high" };
+		reasoning?: { effort?: "low" | "medium" | "high"; summary?: "auto" | "extended" };
 	max_output_tokens?: number;
 	temperature?: number;
 	stream?: boolean;
