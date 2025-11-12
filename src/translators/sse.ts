@@ -1,3 +1,5 @@
+import { normalizeError, sseErrorFrame } from "../error-normalizer";
+
 function generateOpenAIChunkId(): string {
 	const ts = Date.now().toString(36);
 	const rand = Math.random().toString(36).slice(2, 10);
@@ -66,6 +68,7 @@ export function anthropicSSEtoOAIChunks(
 	debugPrefix?: string,
 	debugEvents?: boolean,
 	debugVerbose?: boolean,
+	downstream?: "openai" | "anthropic",
 ): ReadableStream<Uint8Array> {
 	const id = generateOpenAIChunkId();
 	const created = Math.floor(Date.now() / 1000);
@@ -241,7 +244,14 @@ export function anthropicSSEtoOAIChunks(
 				return reader.read().then(handle);
 			}).catch(() => {
 				try {
-					emitDone();
+					const norm = normalizeError({
+						downstream: downstream || "anthropic",
+						downstreamStatus: 502,
+						downstreamBody: "stream terminated",
+					});
+					controller.enqueue(encoder.encode(sseErrorFrame(norm.body)));
+					controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+					finished = true;
 					controller.close();
 				} catch {}
 			});
@@ -256,6 +266,7 @@ export function responsesSSEtoOAIChunks(
 	model: string,
 	downStreamResponse: ReadableStream<Uint8Array>,
 	debugPrefix?: string,
+	downstream?: "openai" | "anthropic",
 ): ReadableStream<Uint8Array> {
 	const id = generateOpenAIChunkId();
 	const created = Math.floor(Date.now() / 1000);
@@ -378,7 +389,14 @@ export function responsesSSEtoOAIChunks(
 				return reader.read().then(handle);
 			}).catch(() => {
 				try {
-					emitDone();
+					const norm = normalizeError({
+						downstream: downstream || "openai",
+						downstreamStatus: 502,
+						downstreamBody: "stream terminated",
+					});
+					controller.enqueue(encoder.encode(sseErrorFrame(norm.body)));
+					controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+					finished = true;
 					controller.close();
 				} catch {}
 			});

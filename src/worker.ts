@@ -10,6 +10,8 @@ import {
 	anthropicJSONtoOAIChatCompletion,
 	responsesJSONtoOAIChatCompletion,
 } from "./schema-mapper";
+import { normalizeError } from "./error-normalizer";
+import { resolveModelAlias } from "./model-alias";
 
 export interface Env {
 	ANTHROPIC_API_KEY: string;
@@ -99,6 +101,14 @@ export default {
 			console.log(`[${requestId}] invalid JSON body`);
 			return oaiErrorEnvelope("Request body must be valid JSON", null, 400);
 		}
+
+		// Optional alias resolution for logs/normalization context (routing remains unchanged)
+		try {
+			const routed = resolveModelAlias((body as any)?.model ?? "");
+			console.log(
+				`[${requestId}] alias routed downstream=${routed.downstream} mode=${routed.mode} upstreamModel=${routed.upstreamModel}`,
+			);
+		} catch {}
 
 		// STEP 2: Basic request introspection for logs
 		// BEFORE: Log complete incoming request (method, URL, headers, parsed JSON body)
@@ -224,15 +234,27 @@ export default {
 
 				// STEP C: Handle non-OK downStreamResponse response
 				if (!downStreamResponse.ok || !downStreamResponse.body) {
-					const text = await downStreamResponse.text().catch(() => "");
-					console.log(
-						`[${requestId}] downStreamResponse non-ok provider=anthropic status=${downStreamResponse.status} model=${model} body_len=${text.length}, request=${JSON.stringify(mapped.request)}`,
-					);
-					return oaiErrorEnvelope(
-						`downStream error (${downStreamResponse.status}). ${text || "Anthropic did not provide additional details."}`,
-						downStreamResponse.status,
-						502,
-					);
+					let parsed: any = null;
+					try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+					const reqId = parsed && typeof parsed === "object" ? (parsed as any).request_id ?? null : null;
+					const norm = normalizeError({
+						downstream: "anthropic",
+						downstreamStatus: downStreamResponse.status,
+						downstreamBody: parsed,
+						downstreamRequestId: reqId,
+					});
+					console.error(JSON.stringify({
+						at: "downstream_error",
+						downstream: "anthropic",
+						downstream_status: downStreamResponse.status,
+						mapped_status: norm.status,
+						mapped_type: norm.body.error.type,
+						mapped_code: norm.body.error.code,
+					}));
+					return new Response(JSON.stringify(norm.body), {
+						status: norm.status,
+						headers: { "content-type": "application/json" },
+					});
 				}
 
 				// STEP D: Translate Anthropic SSE into OpenAI-style streaming chunks
@@ -240,6 +262,9 @@ export default {
 					model,
 					downStreamResponse.body,
 					`[${requestId}] provider=anthropic model=${model}`,
+					undefined,
+					undefined,
+					"anthropic",
 				// 	debugSSE,
 				// 	debugSSEVerbose,
 				);
@@ -290,15 +315,27 @@ export default {
 					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
 				if (!downStreamResponse.ok) {
-					const text = await downStreamResponse.text().catch(() => "");
-					console.log(
-						`[${requestId}] downStreamResponse non-ok provider=anthropic status=${downStreamResponse.status} model=${model} body_len=${text.length}, request=${JSON.stringify(mapped.request)}`,
-					);
-					return oaiErrorEnvelope(
-						`downStreamResponse error (${downStreamResponse.status}). ${text || "Anthropic did not provide additional details."}`,
-						downStreamResponse.status,
-						502,
-					);
+					let parsed: any = null;
+					try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+					const reqId = parsed && typeof parsed === "object" ? (parsed as any).request_id ?? null : null;
+					const norm = normalizeError({
+						downstream: "anthropic",
+						downstreamStatus: downStreamResponse.status,
+						downstreamBody: parsed,
+						downstreamRequestId: reqId,
+					});
+					console.error(JSON.stringify({
+						at: "downstream_error",
+						downstream: "anthropic",
+						downstream_status: downStreamResponse.status,
+						mapped_status: norm.status,
+						mapped_type: norm.body.error.type,
+						mapped_code: norm.body.error.code,
+					}));
+					return new Response(JSON.stringify(norm.body), {
+						status: norm.status,
+						headers: { "content-type": "application/json" },
+					});
 				}
 				const raw = await downStreamResponse.json().catch(() => null as any);
 				const chat = anthropicJSONtoOAIChatCompletion(model, raw || {});
@@ -361,15 +398,25 @@ export default {
 					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
 				if (!downStreamResponse.ok || !downStreamResponse.body) {
-					const text = await downStreamResponse.text().catch(() => "");
-					console.log(
-						`[${requestId}] downStreamResponse non-ok provider=openai-responses status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
-					);
-					return oaiErrorEnvelope(
-						`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
-						downStreamResponse.status,
-						502,
-					);
+					let parsed: any = null;
+					try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+					const norm = normalizeError({
+						downstream: "openai",
+						downstreamStatus: downStreamResponse.status,
+						downstreamBody: parsed,
+					});
+					console.error(JSON.stringify({
+						at: "downstream_error",
+						downstream: "openai",
+						downstream_status: downStreamResponse.status,
+						mapped_status: norm.status,
+						mapped_type: norm.body.error.type,
+						mapped_code: norm.body.error.code,
+					}));
+					return new Response(JSON.stringify(norm.body), {
+						status: norm.status,
+						headers: { "content-type": "application/json" },
+					});
 				}
 				const sseHeaders = new Headers();
 				sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
@@ -384,6 +431,7 @@ export default {
 					model,
 					downStreamResponse.body,
 					`[${requestId}] provider=openai-responses model=${responsesReq.model}`,
+					"openai",
 				);
 				return new Response(translated, { status: 200, headers: sseHeaders });
 			} else {
@@ -400,15 +448,22 @@ export default {
 					return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 				}
 				if (!downStreamResponse.ok) {
-					const text = await downStreamResponse.text().catch(() => "");
-					console.log(
-						`[${requestId}] downStreamResponse non-ok provider=openai-responses status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
-					);
-					return oaiErrorEnvelope(
-						`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
-						downStreamResponse.status,
-						502,
-					);
+					let parsed: any = null;
+					try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+					const norm = normalizeError({
+						downstream: "openai",
+						downstreamStatus: downStreamResponse.status,
+						downstreamBody: parsed,
+					});
+					console.error(JSON.stringify({
+						at: "downstream_error",
+						downstream: "openai",
+						downstream_status: downStreamResponse.status,
+						mapped_status: norm.status,
+						mapped_type: norm.body.error.type,
+						mapped_code: norm.body.error.code,
+					}));
+					return new Response(JSON.stringify(norm.body), { status: norm.status, headers: { "content-type": "application/json" } });
 				}
 				const raw = await downStreamResponse.json().catch(() => null as any);
 				const chat = responsesJSONtoOAIChatCompletion(model, raw || {});
@@ -452,15 +507,25 @@ export default {
 				return oaiErrorEnvelope("downStreamResponse request failed to start", 502, 502);
 			}
 			if (!downStreamResponse.ok || !downStreamResponse.body) {
-				const text = await downStreamResponse.text().catch(() => "");
-				console.log(
-					`[${requestId}] downStreamResponse non-ok provider=openai status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
-				);
-				return oaiErrorEnvelope(
-					`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
-					downStreamResponse.status,
-					502,
-				);
+				let parsed: any = null;
+				try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+				const norm = normalizeError({
+					downstream: "openai",
+					downstreamStatus: downStreamResponse.status,
+					downstreamBody: parsed,
+				});
+				console.error(JSON.stringify({
+					at: "downstream_error",
+					downstream: "openai",
+					downstream_status: downStreamResponse.status,
+					mapped_status: norm.status,
+					mapped_type: norm.body.error.type,
+					mapped_code: norm.body.error.code,
+				}));
+				return new Response(JSON.stringify(norm.body), {
+					status: norm.status,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			const sseHeaders = new Headers();
 			sseHeaders.set("content-type", "text/event-stream; charset=utf-8");
@@ -490,15 +555,25 @@ export default {
 				return oaiErrorEnvelope("downStream request failed to start", 502, 502);
 			}
 			if (!downStreamResponse.ok) {
-				const text = await downStreamResponse.text().catch(() => "");
-				console.log(
-					`[${requestId}] downStreamResponse non-ok provider=openai status=${downStreamResponse.status} model=${model} body_len=${text.length}`,
-				);
-				return oaiErrorEnvelope(
-					`downStreamResponse error (${downStreamResponse.status}). ${text || "OpenAI did not provide additional details."}`,
-					downStreamResponse.status,
-					502,
-				);
+				let parsed: any = null;
+				try { parsed = await downStreamResponse.json(); } catch { parsed = await downStreamResponse.text(); }
+				const norm = normalizeError({
+					downstream: "openai",
+					downstreamStatus: downStreamResponse.status,
+					downstreamBody: parsed,
+				});
+				console.error(JSON.stringify({
+					at: "downstream_error",
+					downstream: "openai",
+					downstream_status: downStreamResponse.status,
+					mapped_status: norm.status,
+					mapped_type: norm.body.error.type,
+					mapped_code: norm.body.error.code,
+				}));
+				return new Response(JSON.stringify(norm.body), {
+					status: norm.status,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			const json = await downStreamResponse.text();
 			console.log(`[${requestId}] downStreamResponse<-openai json_len=${json.length}`);
